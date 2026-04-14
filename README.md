@@ -34,8 +34,8 @@ npm run dev                         # http://localhost:3000
 
 | Name | Purpose |
 |------|---------|
-| `APP_USERNAME` | Login username (`System1`) |
-| `APP_PASSWORD` | Login password (`TestingAI`) |
+| `APP_USERNAME` | Login username |
+| `APP_PASSWORD` | Login password |
 | `SESSION_SECRET` | HMAC key for signed session cookie. ≥ 16 chars random. |
 | `GEMINI_API_KEY` | Google AI Studio API key |
 | `GEMINI_MODEL` | Model name (default `gemma-4-26b-a4b-it`) |
@@ -54,22 +54,6 @@ in. The three files to edit are:
 
 Types and shape are fixed in `lib/benchmarks/types.ts`; only the values
 inside each file need to change.
-
-## Deploying to Vercel
-
-1. Push this repo to GitHub.
-2. In Vercel, "Import Project" → select the repo.
-3. Framework: **Next.js** (auto-detected).
-4. Add the 5 env vars above under Project → Settings → Environment Variables.
-5. Deploy. The login page gates every route via `proxy.ts` (Next.js 16 proxy/middleware).
-
-## Verification
-
-- `/` redirects to `/login` when no session cookie is present.
-- Login with `System1` / `TestingAI` → calculator renders.
-- Paste a screener → `/api/validate` → `VerdictCard` + `CriteriaBreakdown`.
-- Malformed screener → parser-failure card with raw LLM output visible.
-- `POST /api/logout` clears the cookie.
 
 ## Safety / determinism notes
 
