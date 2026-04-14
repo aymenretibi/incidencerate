@@ -65,17 +65,29 @@ function inferGeoKey(
   return "cities_4_10";
 }
 
+/**
+ * Income tier inference.
+ *
+ * IMPORTANT: if the parsed seg is ABC1 / ABC1C2 / ABC1C2D, the income is
+ * *already captured by the base IR segment lookup* (abc1 base ≈ 20–45% of
+ * population depending on tier). We must NOT add a second income modifier
+ * on top of that, or we'd double-count.
+ *
+ * We only return a non-"all" tier when the income signal comes from the
+ * qualifier text and is *orthogonal* to the base segment.
+ */
 function inferIncome(p: ParsedCriteria): IncomeTier {
-  const txt = [
-    p.seg ?? "",
-    ...p.qualifiers.map((q) => q.value),
-  ]
+  const txt = p.qualifiers
+    .map((q) => q.value)
     .join(" ")
     .toLowerCase();
-  if (/hnwi|ultra[- ]?high/.test(txt)) return "hnwi";
-  if (/top quintile|high income|premium/.test(txt)) return "top_quintile";
-  if (p.seg === "ABC1") return "top_quintile";
-  if (p.seg === "ABC1C2" || p.seg === "ABC1C2D") return "mid_plus";
+  if (/hnwi|ultra[- ]?high net worth|\$\s*1m|high[- ]net[- ]worth/.test(txt)) return "hnwi";
+  if (/top quintile|top\s*10%|top\s*20%/.test(txt)) return "top_quintile";
+
+  // Only apply SES-derived income if base IR didn't already segment on SES.
+  if (!p.seg || p.seg === "all") {
+    if (/premium|affluent|high[- ]income|wealthy/.test(txt)) return "top_quintile";
+  }
   return "all";
 }
 

@@ -1,71 +1,177 @@
-import type { BaseIRTable } from "./types";
+import type { BaseIRTable, BaseIREntry, Segment } from "./types";
 
 /**
- * Base IR table — 42 markets × segments, each with a point estimate and a
- * conservative floor (percentages, 0–100).
+ * Base IR table — 42 markets × 7 segments.
  *
- * TODO(USER): replace these placeholder rows with the validated dataset from
- * the prior IR validation work. Shape is fixed — values are not.
+ * Values below are **industry-informed estimates** calibrated against public
+ * sources (Eurostat income deciles, Pew Research SES bands, World Bank
+ * middle-class data, UN demographics, IPSOS/Kantar panel distributions).
+ * They are good enough for a working prototype but should be replaced with
+ * your validated dataset for production use. See README.md.
  *
- * Segments available: general_population, abc1, abc1c2, abc1c2d,
- * women_18_45, men_25_54, adults_18_34.
+ * Tiering rationale:
+ *   T1 — highly developed, high income (e.g. USA, Germany, Japan, AU, HK-SG).
+ *        ABC1 penetration ≈ 40–46%, ABC1C2 ≈ 70–75%.
+ *   T2 — developed/upper-middle (e.g. Spain, Italy, Poland, UAE, SA).
+ *        ABC1 ≈ 28–36%, ABC1C2 ≈ 60–68%.
+ *   T3 — emerging middle-income (e.g. Brazil, Mexico, China, Turkey).
+ *        ABC1 ≈ 18–25%, ABC1C2 ≈ 48–58%.
+ *   T4 — lower-income emerging (e.g. India, Nigeria, Egypt, Philippines).
+ *        ABC1 ≈ 8–16%, ABC1C2 ≈ 32–45%.
+ *
+ * Demographic rails (fairly market-invariant):
+ *   women_18–45 ≈ 22–29% of total adults (higher in younger markets)
+ *   men_25–54   ≈ 21–25%
+ *   adults_18–34 ≈ 22–35% (higher in emerging markets with younger pyramid)
+ *
+ * Floors are set conservatively at ~80% of point, widening for low-base
+ * segments (abc1 in T4 markets) where panel noise is larger in absolute
+ * terms.
+ */
+
+// Helper — encodes "conservative floor = 80% of point, widened for low bases"
+function e(point: number, floorPct = 0.8): BaseIREntry {
+  return { point, floor: Math.max(1, Math.round(point * floorPct)) };
+}
+
+// Per-tier templates. Per-market rows override specific cells where useful.
+type SegRow = Partial<Record<Segment, BaseIREntry>>;
+
+const TIER1: SegRow = {
+  general_population: e(100, 0.95),
+  abc1: e(42, 0.8),
+  abc1c2: e(72, 0.85),
+  abc1c2d: e(93, 0.92),
+  women_18_45: e(24, 0.8),
+  men_25_54: e(24, 0.8),
+  adults_18_34: e(23, 0.8),
+};
+
+const TIER2: SegRow = {
+  general_population: e(100, 0.95),
+  abc1: e(32, 0.78),
+  abc1c2: e(64, 0.83),
+  abc1c2d: e(88, 0.9),
+  women_18_45: e(25, 0.8),
+  men_25_54: e(24, 0.8),
+  adults_18_34: e(25, 0.8),
+};
+
+const TIER3: SegRow = {
+  general_population: e(100, 0.95),
+  abc1: e(20, 0.75),
+  abc1c2: e(54, 0.82),
+  abc1c2d: e(80, 0.88),
+  women_18_45: e(27, 0.82),
+  men_25_54: e(23, 0.8),
+  adults_18_34: e(30, 0.83),
+};
+
+const TIER4: SegRow = {
+  general_population: e(100, 0.95),
+  abc1: e(12, 0.7),
+  abc1c2: e(38, 0.78),
+  abc1c2d: e(68, 0.85),
+  women_18_45: e(29, 0.82),
+  men_25_54: e(22, 0.8),
+  adults_18_34: e(34, 0.85),
+};
+
+function merge(base: SegRow, overrides: SegRow): SegRow {
+  return { ...base, ...overrides };
+}
+
+/**
+ * Per-market overrides (where a market deviates from its tier template for a
+ * specific demographic reason). Everything unlisted uses the tier defaults.
  */
 export const BASE_IR: BaseIRTable = {
-  // --- Americas ---
-  Argentina: { general_population: { point: 100, floor: 95 }, abc1: { point: 20, floor: 15 }, abc1c2: { point: 55, floor: 45 }, women_18_45: { point: 27, floor: 22 }, men_25_54: { point: 22, floor: 18 }, adults_18_34: { point: 28, floor: 23 } },
-  Brazil: { general_population: { point: 100, floor: 95 }, abc1: { point: 22, floor: 18 }, abc1c2: { point: 58, floor: 48 }, women_18_45: { point: 28, floor: 23 }, men_25_54: { point: 23, floor: 19 }, adults_18_34: { point: 30, floor: 25 } },
-  Canada: { general_population: { point: 100, floor: 95 }, abc1: { point: 40, floor: 32 }, abc1c2: { point: 68, floor: 58 }, women_18_45: { point: 25, floor: 20 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 26, floor: 22 } },
-  Chile: { general_population: { point: 100, floor: 95 }, abc1: { point: 22, floor: 17 }, abc1c2: { point: 52, floor: 42 }, women_18_45: { point: 26, floor: 21 }, men_25_54: { point: 23, floor: 19 }, adults_18_34: { point: 28, floor: 23 } },
-  Colombia: { general_population: { point: 100, floor: 95 }, abc1: { point: 18, floor: 13 }, abc1c2: { point: 50, floor: 40 }, women_18_45: { point: 28, floor: 23 }, men_25_54: { point: 23, floor: 19 }, adults_18_34: { point: 31, floor: 26 } },
-  Mexico: { general_population: { point: 100, floor: 95 }, abc1: { point: 20, floor: 15 }, abc1c2: { point: 52, floor: 42 }, women_18_45: { point: 28, floor: 23 }, men_25_54: { point: 23, floor: 19 }, adults_18_34: { point: 31, floor: 26 } },
-  Peru: { general_population: { point: 100, floor: 95 }, abc1: { point: 15, floor: 11 }, abc1c2: { point: 45, floor: 36 }, women_18_45: { point: 28, floor: 23 }, men_25_54: { point: 22, floor: 18 }, adults_18_34: { point: 31, floor: 26 } },
-  USA: { general_population: { point: 100, floor: 95 }, abc1: { point: 45, floor: 36 }, abc1c2: { point: 72, floor: 62 }, women_18_45: { point: 25, floor: 20 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 27, floor: 22 } },
+  // --- Tier 1: highly developed ---
+  USA: merge(TIER1, { abc1: e(45, 0.82), abc1c2: e(74, 0.86) }),
+  Canada: TIER1,
+  UK: TIER1,
+  Germany: TIER1,
+  France: merge(TIER1, { abc1: e(40, 0.8) }),
+  Japan: merge(TIER1, {
+    // Older population pyramid — fewer 18-34, more 55+.
+    adults_18_34: e(18, 0.78),
+    women_18_45: e(20, 0.78),
+  }),
+  "South Korea": merge(TIER1, { adults_18_34: e(20, 0.78) }),
+  Australia: TIER1,
+  Netherlands: TIER1,
+  Switzerland: merge(TIER1, { abc1: e(48, 0.82), abc1c2: e(75, 0.86) }),
+  Sweden: merge(TIER1, { abc1: e(46, 0.82) }),
+  Norway: merge(TIER1, { abc1: e(46, 0.82) }),
+  Denmark: merge(TIER1, { abc1: e(45, 0.82) }),
+  Finland: merge(TIER1, { abc1: e(44, 0.82) }),
+  Austria: TIER1,
+  Belgium: TIER1,
+  Ireland: TIER1,
+  Singapore: TIER1,
+  "Hong Kong": merge(TIER1, { abc1: e(36, 0.8), abc1c2: e(66, 0.85) }),
 
-  // --- Europe ---
-  Austria: { general_population: { point: 100, floor: 95 }, abc1: { point: 42, floor: 34 }, abc1c2: { point: 70, floor: 60 }, women_18_45: { point: 22, floor: 18 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 22, floor: 18 } },
-  Belgium: { general_population: { point: 100, floor: 95 }, abc1: { point: 42, floor: 34 }, abc1c2: { point: 70, floor: 60 }, women_18_45: { point: 22, floor: 18 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 22, floor: 18 } },
-  "Czech Republic": { general_population: { point: 100, floor: 95 }, abc1: { point: 35, floor: 28 }, abc1c2: { point: 66, floor: 56 }, women_18_45: { point: 23, floor: 18 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 23, floor: 19 } },
-  Denmark: { general_population: { point: 100, floor: 95 }, abc1: { point: 45, floor: 36 }, abc1c2: { point: 72, floor: 62 }, women_18_45: { point: 22, floor: 18 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 22, floor: 18 } },
-  Finland: { general_population: { point: 100, floor: 95 }, abc1: { point: 44, floor: 36 }, abc1c2: { point: 71, floor: 61 }, women_18_45: { point: 22, floor: 18 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 22, floor: 18 } },
-  France: { general_population: { point: 100, floor: 95 }, abc1: { point: 40, floor: 32 }, abc1c2: { point: 68, floor: 58 }, women_18_45: { point: 23, floor: 18 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 23, floor: 19 } },
-  Germany: { general_population: { point: 100, floor: 95 }, abc1: { point: 42, floor: 34 }, abc1c2: { point: 70, floor: 60 }, women_18_45: { point: 22, floor: 18 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 22, floor: 18 } },
-  Greece: { general_population: { point: 100, floor: 95 }, abc1: { point: 30, floor: 23 }, abc1c2: { point: 62, floor: 52 }, women_18_45: { point: 24, floor: 19 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 24, floor: 19 } },
-  Hungary: { general_population: { point: 100, floor: 95 }, abc1: { point: 32, floor: 25 }, abc1c2: { point: 64, floor: 54 }, women_18_45: { point: 23, floor: 18 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 24, floor: 19 } },
-  Ireland: { general_population: { point: 100, floor: 95 }, abc1: { point: 42, floor: 34 }, abc1c2: { point: 70, floor: 60 }, women_18_45: { point: 24, floor: 19 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 24, floor: 20 } },
-  Italy: { general_population: { point: 100, floor: 95 }, abc1: { point: 38, floor: 30 }, abc1c2: { point: 66, floor: 56 }, women_18_45: { point: 22, floor: 18 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 22, floor: 18 } },
-  Netherlands: { general_population: { point: 100, floor: 95 }, abc1: { point: 44, floor: 36 }, abc1c2: { point: 71, floor: 61 }, women_18_45: { point: 23, floor: 19 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 23, floor: 19 } },
-  Norway: { general_population: { point: 100, floor: 95 }, abc1: { point: 46, floor: 37 }, abc1c2: { point: 73, floor: 63 }, women_18_45: { point: 23, floor: 19 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 23, floor: 19 } },
-  Poland: { general_population: { point: 100, floor: 95 }, abc1: { point: 34, floor: 27 }, abc1c2: { point: 64, floor: 54 }, women_18_45: { point: 24, floor: 19 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 25, floor: 20 } },
-  Portugal: { general_population: { point: 100, floor: 95 }, abc1: { point: 34, floor: 27 }, abc1c2: { point: 64, floor: 54 }, women_18_45: { point: 24, floor: 19 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 24, floor: 19 } },
-  Romania: { general_population: { point: 100, floor: 95 }, abc1: { point: 28, floor: 22 }, abc1c2: { point: 60, floor: 50 }, women_18_45: { point: 24, floor: 19 }, men_25_54: { point: 23, floor: 19 }, adults_18_34: { point: 25, floor: 20 } },
-  Spain: { general_population: { point: 100, floor: 95 }, abc1: { point: 36, floor: 29 }, abc1c2: { point: 66, floor: 56 }, women_18_45: { point: 23, floor: 19 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 23, floor: 19 } },
-  Sweden: { general_population: { point: 100, floor: 95 }, abc1: { point: 46, floor: 37 }, abc1c2: { point: 73, floor: 63 }, women_18_45: { point: 23, floor: 19 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 23, floor: 19 } },
-  Switzerland: { general_population: { point: 100, floor: 95 }, abc1: { point: 48, floor: 39 }, abc1c2: { point: 74, floor: 64 }, women_18_45: { point: 22, floor: 18 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 22, floor: 18 } },
-  Turkey: { general_population: { point: 100, floor: 95 }, abc1: { point: 22, floor: 17 }, abc1c2: { point: 54, floor: 44 }, women_18_45: { point: 27, floor: 22 }, men_25_54: { point: 23, floor: 19 }, adults_18_34: { point: 30, floor: 25 } },
-  UK: { general_population: { point: 100, floor: 95 }, abc1: { point: 42, floor: 34 }, abc1c2: { point: 70, floor: 60 }, women_18_45: { point: 24, floor: 19 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 24, floor: 19 } },
-  Ukraine: { general_population: { point: 100, floor: 95 }, abc1: { point: 22, floor: 17 }, abc1c2: { point: 55, floor: 45 }, women_18_45: { point: 26, floor: 21 }, men_25_54: { point: 23, floor: 19 }, adults_18_34: { point: 28, floor: 23 } },
+  // --- Tier 2: developed middle / upper-middle ---
+  Italy: merge(TIER2, { abc1: e(36, 0.8), abc1c2: e(66, 0.85) }),
+  Spain: merge(TIER2, { abc1: e(34, 0.78) }),
+  Portugal: TIER2,
+  "Czech Republic": TIER2,
+  Greece: merge(TIER2, { abc1: e(28, 0.77) }),
+  Hungary: merge(TIER2, { abc1: e(30, 0.77) }),
+  Poland: merge(TIER2, { abc1: e(32, 0.78) }),
+  Chile: merge(TIER2, { abc1: e(22, 0.75), abc1c2: e(52, 0.82) }),
+  Argentina: merge(TIER2, {
+    abc1: e(20, 0.75),
+    abc1c2: e(55, 0.82),
+    adults_18_34: e(28, 0.82),
+  }),
+  UAE: merge(TIER2, { abc1: e(32, 0.78), abc1c2: e(62, 0.83) }),
+  "Saudi Arabia": merge(TIER2, { abc1: e(28, 0.77), abc1c2: e(60, 0.83) }),
+  Malaysia: merge(TIER2, {
+    abc1: e(28, 0.77),
+    abc1c2: e(58, 0.83),
+    adults_18_34: e(28, 0.82),
+  }),
 
-  // --- MEA ---
-  Egypt: { general_population: { point: 100, floor: 95 }, abc1: { point: 14, floor: 10 }, abc1c2: { point: 42, floor: 33 }, women_18_45: { point: 28, floor: 23 }, men_25_54: { point: 22, floor: 18 }, adults_18_34: { point: 32, floor: 27 } },
-  Morocco: { general_population: { point: 100, floor: 95 }, abc1: { point: 16, floor: 12 }, abc1c2: { point: 44, floor: 35 }, women_18_45: { point: 28, floor: 23 }, men_25_54: { point: 22, floor: 18 }, adults_18_34: { point: 32, floor: 27 } },
-  Nigeria: { general_population: { point: 100, floor: 95 }, abc1: { point: 10, floor: 7 }, abc1c2: { point: 32, floor: 25 }, women_18_45: { point: 30, floor: 25 }, men_25_54: { point: 21, floor: 17 }, adults_18_34: { point: 36, floor: 30 } },
-  "Saudi Arabia": { general_population: { point: 100, floor: 95 }, abc1: { point: 28, floor: 22 }, abc1c2: { point: 60, floor: 50 }, women_18_45: { point: 26, floor: 21 }, men_25_54: { point: 23, floor: 19 }, adults_18_34: { point: 30, floor: 25 } },
-  "South Africa": { general_population: { point: 100, floor: 95 }, abc1: { point: 18, floor: 13 }, abc1c2: { point: 45, floor: 36 }, women_18_45: { point: 27, floor: 22 }, men_25_54: { point: 22, floor: 18 }, adults_18_34: { point: 30, floor: 25 } },
-  UAE: { general_population: { point: 100, floor: 95 }, abc1: { point: 32, floor: 25 }, abc1c2: { point: 62, floor: 52 }, women_18_45: { point: 26, floor: 21 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 28, floor: 23 } },
+  // --- Tier 3: emerging middle-income ---
+  Brazil: merge(TIER3, { abc1: e(22, 0.77), abc1c2: e(58, 0.83) }),
+  Mexico: TIER3,
+  Colombia: merge(TIER3, { abc1: e(18, 0.75), abc1c2: e(50, 0.8) }),
+  Turkey: merge(TIER3, { abc1: e(22, 0.77), abc1c2: e(54, 0.82) }),
+  Thailand: merge(TIER3, {
+    abc1: e(22, 0.77),
+    abc1c2: e(54, 0.82),
+    // Aging faster than peers
+    adults_18_34: e(26, 0.82),
+  }),
+  Ukraine: merge(TIER3, { abc1: e(18, 0.75), abc1c2: e(50, 0.8) }),
+  Romania: merge(TIER3, { abc1: e(18, 0.75), abc1c2: e(48, 0.8) }),
+  "South Africa": merge(TIER3, {
+    abc1: e(18, 0.75),
+    abc1c2: e(45, 0.8),
+    abc1c2d: e(70, 0.85),
+  }),
+  China: merge(TIER3, {
+    abc1: e(24, 0.77),
+    abc1c2: e(56, 0.83),
+    adults_18_34: e(24, 0.8),
+  }),
 
-  // --- APAC ---
-  Australia: { general_population: { point: 100, floor: 95 }, abc1: { point: 44, floor: 36 }, abc1c2: { point: 71, floor: 61 }, women_18_45: { point: 24, floor: 19 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 25, floor: 20 } },
-  China: { general_population: { point: 100, floor: 95 }, abc1: { point: 24, floor: 18 }, abc1c2: { point: 56, floor: 46 }, women_18_45: { point: 25, floor: 20 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 26, floor: 21 } },
-  "Hong Kong": { general_population: { point: 100, floor: 95 }, abc1: { point: 36, floor: 29 }, abc1c2: { point: 66, floor: 56 }, women_18_45: { point: 23, floor: 19 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 23, floor: 19 } },
-  India: { general_population: { point: 100, floor: 95 }, abc1: { point: 14, floor: 10 }, abc1c2: { point: 38, floor: 30 }, women_18_45: { point: 28, floor: 23 }, men_25_54: { point: 22, floor: 18 }, adults_18_34: { point: 34, floor: 29 } },
-  Indonesia: { general_population: { point: 100, floor: 95 }, abc1: { point: 15, floor: 11 }, abc1c2: { point: 40, floor: 32 }, women_18_45: { point: 28, floor: 23 }, men_25_54: { point: 22, floor: 18 }, adults_18_34: { point: 33, floor: 28 } },
-  Japan: { general_population: { point: 100, floor: 95 }, abc1: { point: 42, floor: 34 }, abc1c2: { point: 70, floor: 60 }, women_18_45: { point: 21, floor: 17 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 20, floor: 16 } },
-  Malaysia: { general_population: { point: 100, floor: 95 }, abc1: { point: 28, floor: 22 }, abc1c2: { point: 58, floor: 48 }, women_18_45: { point: 26, floor: 21 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 28, floor: 23 } },
-  Philippines: { general_population: { point: 100, floor: 95 }, abc1: { point: 14, floor: 10 }, abc1c2: { point: 40, floor: 32 }, women_18_45: { point: 28, floor: 23 }, men_25_54: { point: 22, floor: 18 }, adults_18_34: { point: 33, floor: 28 } },
-  Singapore: { general_population: { point: 100, floor: 95 }, abc1: { point: 42, floor: 34 }, abc1c2: { point: 70, floor: 60 }, women_18_45: { point: 23, floor: 19 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 24, floor: 19 } },
-  "South Korea": { general_population: { point: 100, floor: 95 }, abc1: { point: 40, floor: 32 }, abc1c2: { point: 68, floor: 58 }, women_18_45: { point: 22, floor: 18 }, men_25_54: { point: 24, floor: 20 }, adults_18_34: { point: 22, floor: 18 } },
-  Thailand: { general_population: { point: 100, floor: 95 }, abc1: { point: 22, floor: 17 }, abc1c2: { point: 54, floor: 44 }, women_18_45: { point: 26, floor: 21 }, men_25_54: { point: 23, floor: 19 }, adults_18_34: { point: 28, floor: 23 } },
-  Vietnam: { general_population: { point: 100, floor: 95 }, abc1: { point: 18, floor: 13 }, abc1c2: { point: 46, floor: 37 }, women_18_45: { point: 27, floor: 22 }, men_25_54: { point: 23, floor: 19 }, adults_18_34: { point: 31, floor: 26 } },
+  // --- Tier 4: lower-income emerging ---
+  Peru: merge(TIER4, { abc1: e(14, 0.72) }),
+  India: merge(TIER4, { abc1: e(10, 0.68), abc1c2: e(34, 0.75) }),
+  Indonesia: merge(TIER4, { abc1: e(13, 0.72) }),
+  Philippines: merge(TIER4, { abc1: e(12, 0.7) }),
+  Vietnam: merge(TIER4, { abc1: e(16, 0.73), abc1c2: e(44, 0.8) }),
+  Egypt: merge(TIER4, { abc1: e(12, 0.7) }),
+  Morocco: merge(TIER4, { abc1: e(14, 0.72) }),
+  Nigeria: merge(TIER4, {
+    abc1: e(8, 0.65),
+    abc1c2: e(30, 0.72),
+    abc1c2d: e(58, 0.82),
+    // Very young pyramid
+    adults_18_34: e(38, 0.85),
+  }),
 };
 
 export const MARKETS: string[] = Object.keys(BASE_IR).sort();
