@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 import { parseScreener } from "@/lib/gemini";
 import { calculate } from "@/lib/calculate";
-import { BASE_IR } from "@/lib/benchmarks/baseIR";
+import { SES_PENETRATION } from "@/lib/benchmarks/baseIR";
 import type { PanelType, ParsedCriteria } from "@/lib/benchmarks/types";
 
 export const runtime = "nodejs";
@@ -34,7 +34,7 @@ export async function POST(req: Request) {
 
   const { screener, market, panel_type, assumed_ir, target_n } = parsed.data;
 
-  if (!BASE_IR[market]) {
+  if (!SES_PENETRATION[market]) {
     return NextResponse.json(
       { error: `unknown market: ${market}` },
       { status: 400 },
@@ -59,8 +59,8 @@ export async function POST(req: Request) {
     );
   }
 
-  // UI values override the LLM's extracted fields for market/assumed_ir/panel,
-  // since the UI is the source of truth for those.
+  // UI values override LLM extraction for market/assumed_ir/panel — the UI
+  // is authoritative for those fields.
   const criteria: ParsedCriteria = {
     ...(llm.data as ParsedCriteria),
     market,

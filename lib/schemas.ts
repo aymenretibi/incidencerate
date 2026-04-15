@@ -4,10 +4,12 @@ export const ParsedCriteriaSchema = z.object({
   market: z.string().nullable(),
   target_n: z.number().int().positive().nullable(),
   assumed_ir: z.number().min(0).max(100).nullable(),
+
   age_min: z.number().int().min(0).max(120).nullable(),
   age_max: z.number().int().min(0).max(120).nullable(),
   gender: z.enum(["male", "female", "all"]),
   seg: z.enum(["ABC1", "ABC1C2", "ABC1C2D", "all"]).nullable(),
+
   category: z
     .enum(["financial", "fmcg", "tech", "auto", "healthcare", "other"])
     .nullable(),
@@ -24,6 +26,17 @@ export const ParsedCriteriaSchema = z.object({
   ),
   logic: z.enum(["AND", "OR"]),
   panel_type: z.enum(["online", "cati", "f2f", "hybrid"]).nullable(),
+
+  // Rule 2 — expanded granularity:
+  recency: z.enum(["P3M", "P6M", "P12M", "ever"]).nullable(),
+  frequency: z.enum(["heavy", "medium", "light"]).nullable(),
+  brand_specificity: z
+    .enum(["category_only", "specific_brand", "niche_premium"])
+    .nullable(),
+  attitudinal: z.array(z.string()),
+  exclusions: z.array(z.string()),
+  clinical: z.boolean(),
+
   notes: z.string(),
 });
 

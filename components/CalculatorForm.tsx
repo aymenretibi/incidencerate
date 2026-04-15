@@ -205,7 +205,7 @@ export function CalculatorForm({ markets }: Props) {
               <VerdictCard result={response.result} />
               <CriteriaBreakdown
                 criteria={response.criteria}
-                applied={response.result.modifiers_applied}
+                layers={response.result.layers}
               />
             </>
           )}

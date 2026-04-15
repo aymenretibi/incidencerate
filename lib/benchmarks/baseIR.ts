@@ -1,177 +1,124 @@
-import type { BaseIRTable, BaseIREntry, Segment } from "./types";
+import type { Market, Range } from "./types";
 
 /**
- * Base IR table — 42 markets × 7 segments.
+ * SES penetration table — fraction of the adult population in each SES
+ * tier, per market, expressed as a three-point range {low, point, high}.
  *
- * Values below are **industry-informed estimates** calibrated against public
- * sources (Eurostat income deciles, Pew Research SES bands, World Bank
- * middle-class data, UN demographics, IPSOS/Kantar panel distributions).
- * They are good enough for a working prototype but should be replaced with
- * your validated dataset for production use. See README.md.
+ * Used as one layer in the screening funnel (Rule 2) — not as a "base IR"
+ * in the old multiplicative sense. The funnel always starts at 100% panel
+ * base and applies SES sequentially.
  *
- * Tiering rationale:
- *   T1 — highly developed, high income (e.g. USA, Germany, Japan, AU, HK-SG).
- *        ABC1 penetration ≈ 40–46%, ABC1C2 ≈ 70–75%.
- *   T2 — developed/upper-middle (e.g. Spain, Italy, Poland, UAE, SA).
- *        ABC1 ≈ 28–36%, ABC1C2 ≈ 60–68%.
- *   T3 — emerging middle-income (e.g. Brazil, Mexico, China, Turkey).
- *        ABC1 ≈ 18–25%, ABC1C2 ≈ 48–58%.
- *   T4 — lower-income emerging (e.g. India, Nigeria, Egypt, Philippines).
- *        ABC1 ≈ 8–16%, ABC1C2 ≈ 32–45%.
+ * Values are industry-informed estimates tiered by market development:
+ *   T1 — highly developed (US, DE, JP, UK, SG, HK, Nordics)
+ *   T2 — developed / upper-middle (S/S-E EU, UAE, SA, MY, CL, AR)
+ *   T3 — emerging middle-income (BR, MX, CN, TR, CO, TH, ZA)
+ *   T4 — lower-income emerging (IN, NG, EG, PH, ID, VN, MA, PE)
  *
- * Demographic rails (fairly market-invariant):
- *   women_18–45 ≈ 22–29% of total adults (higher in younger markets)
- *   men_25–54   ≈ 21–25%
- *   adults_18–34 ≈ 22–35% (higher in emerging markets with younger pyramid)
- *
- * Floors are set conservatively at ~80% of point, widening for low-base
- * segments (abc1 in T4 markets) where panel noise is larger in absolute
- * terms.
+ * Sources: Eurostat income deciles, Pew SES bands, World Bank middle-class,
+ * market-specific syndicated SES distributions. Replace with validated
+ * dataset for production.
  */
 
-// Helper — encodes "conservative floor = 80% of point, widened for low bases"
-function e(point: number, floorPct = 0.8): BaseIREntry {
-  return { point, floor: Math.max(1, Math.round(point * floorPct)) };
-}
+type Tier = "abc1" | "abc1c2" | "abc1c2d";
 
-// Per-tier templates. Per-market rows override specific cells where useful.
-type SegRow = Partial<Record<Segment, BaseIREntry>>;
+const R = (low: number, point: number, high: number): Range => ({
+  low,
+  point,
+  high,
+});
 
-const TIER1: SegRow = {
-  general_population: e(100, 0.95),
-  abc1: e(42, 0.8),
-  abc1c2: e(72, 0.85),
-  abc1c2d: e(93, 0.92),
-  women_18_45: e(24, 0.8),
-  men_25_54: e(24, 0.8),
-  adults_18_34: e(23, 0.8),
+type TierRow = Record<Tier, Range>;
+
+// Per-tier templates (pass rates as decimals 0–1).
+const T1: TierRow = {
+  abc1: R(0.36, 0.42, 0.48),
+  abc1c2: R(0.66, 0.72, 0.78),
+  abc1c2d: R(0.9, 0.93, 0.96),
+};
+const T2: TierRow = {
+  abc1: R(0.26, 0.32, 0.38),
+  abc1c2: R(0.58, 0.64, 0.7),
+  abc1c2d: R(0.84, 0.88, 0.92),
+};
+const T3: TierRow = {
+  abc1: R(0.16, 0.2, 0.24),
+  abc1c2: R(0.48, 0.54, 0.6),
+  abc1c2d: R(0.74, 0.8, 0.86),
+};
+const T4: TierRow = {
+  abc1: R(0.08, 0.12, 0.16),
+  abc1c2: R(0.32, 0.38, 0.44),
+  abc1c2d: R(0.6, 0.68, 0.76),
 };
 
-const TIER2: SegRow = {
-  general_population: e(100, 0.95),
-  abc1: e(32, 0.78),
-  abc1c2: e(64, 0.83),
-  abc1c2d: e(88, 0.9),
-  women_18_45: e(25, 0.8),
-  men_25_54: e(24, 0.8),
-  adults_18_34: e(25, 0.8),
-};
-
-const TIER3: SegRow = {
-  general_population: e(100, 0.95),
-  abc1: e(20, 0.75),
-  abc1c2: e(54, 0.82),
-  abc1c2d: e(80, 0.88),
-  women_18_45: e(27, 0.82),
-  men_25_54: e(23, 0.8),
-  adults_18_34: e(30, 0.83),
-};
-
-const TIER4: SegRow = {
-  general_population: e(100, 0.95),
-  abc1: e(12, 0.7),
-  abc1c2: e(38, 0.78),
-  abc1c2d: e(68, 0.85),
-  women_18_45: e(29, 0.82),
-  men_25_54: e(22, 0.8),
-  adults_18_34: e(34, 0.85),
-};
-
-function merge(base: SegRow, overrides: SegRow): SegRow {
+function merge(base: TierRow, overrides: Partial<TierRow>): TierRow {
   return { ...base, ...overrides };
 }
 
-/**
- * Per-market overrides (where a market deviates from its tier template for a
- * specific demographic reason). Everything unlisted uses the tier defaults.
- */
-export const BASE_IR: BaseIRTable = {
-  // --- Tier 1: highly developed ---
-  USA: merge(TIER1, { abc1: e(45, 0.82), abc1c2: e(74, 0.86) }),
-  Canada: TIER1,
-  UK: TIER1,
-  Germany: TIER1,
-  France: merge(TIER1, { abc1: e(40, 0.8) }),
-  Japan: merge(TIER1, {
-    // Older population pyramid — fewer 18-34, more 55+.
-    adults_18_34: e(18, 0.78),
-    women_18_45: e(20, 0.78),
-  }),
-  "South Korea": merge(TIER1, { adults_18_34: e(20, 0.78) }),
-  Australia: TIER1,
-  Netherlands: TIER1,
-  Switzerland: merge(TIER1, { abc1: e(48, 0.82), abc1c2: e(75, 0.86) }),
-  Sweden: merge(TIER1, { abc1: e(46, 0.82) }),
-  Norway: merge(TIER1, { abc1: e(46, 0.82) }),
-  Denmark: merge(TIER1, { abc1: e(45, 0.82) }),
-  Finland: merge(TIER1, { abc1: e(44, 0.82) }),
-  Austria: TIER1,
-  Belgium: TIER1,
-  Ireland: TIER1,
-  Singapore: TIER1,
-  "Hong Kong": merge(TIER1, { abc1: e(36, 0.8), abc1c2: e(66, 0.85) }),
+export const SES_PENETRATION: Record<Market, TierRow> = {
+  // --- Tier 1 ---
+  USA: merge(T1, { abc1: R(0.4, 0.45, 0.5), abc1c2: R(0.68, 0.74, 0.8) }),
+  Canada: T1,
+  UK: T1,
+  Germany: T1,
+  France: merge(T1, { abc1: R(0.34, 0.4, 0.46) }),
+  Japan: T1,
+  "South Korea": T1,
+  Australia: T1,
+  Netherlands: T1,
+  Switzerland: merge(T1, { abc1: R(0.42, 0.48, 0.54), abc1c2: R(0.7, 0.75, 0.8) }),
+  Sweden: merge(T1, { abc1: R(0.4, 0.46, 0.52) }),
+  Norway: merge(T1, { abc1: R(0.4, 0.46, 0.52) }),
+  Denmark: T1,
+  Finland: merge(T1, { abc1: R(0.38, 0.44, 0.5) }),
+  Austria: T1,
+  Belgium: T1,
+  Ireland: T1,
+  Singapore: T1,
+  "Hong Kong": merge(T1, { abc1: R(0.3, 0.36, 0.42), abc1c2: R(0.6, 0.66, 0.72) }),
 
-  // --- Tier 2: developed middle / upper-middle ---
-  Italy: merge(TIER2, { abc1: e(36, 0.8), abc1c2: e(66, 0.85) }),
-  Spain: merge(TIER2, { abc1: e(34, 0.78) }),
-  Portugal: TIER2,
-  "Czech Republic": TIER2,
-  Greece: merge(TIER2, { abc1: e(28, 0.77) }),
-  Hungary: merge(TIER2, { abc1: e(30, 0.77) }),
-  Poland: merge(TIER2, { abc1: e(32, 0.78) }),
-  Chile: merge(TIER2, { abc1: e(22, 0.75), abc1c2: e(52, 0.82) }),
-  Argentina: merge(TIER2, {
-    abc1: e(20, 0.75),
-    abc1c2: e(55, 0.82),
-    adults_18_34: e(28, 0.82),
-  }),
-  UAE: merge(TIER2, { abc1: e(32, 0.78), abc1c2: e(62, 0.83) }),
-  "Saudi Arabia": merge(TIER2, { abc1: e(28, 0.77), abc1c2: e(60, 0.83) }),
-  Malaysia: merge(TIER2, {
-    abc1: e(28, 0.77),
-    abc1c2: e(58, 0.83),
-    adults_18_34: e(28, 0.82),
-  }),
+  // --- Tier 2 ---
+  Italy: merge(T2, { abc1: R(0.3, 0.36, 0.42), abc1c2: R(0.6, 0.66, 0.72) }),
+  Spain: merge(T2, { abc1: R(0.28, 0.34, 0.4) }),
+  Portugal: T2,
+  "Czech Republic": T2,
+  Greece: merge(T2, { abc1: R(0.22, 0.28, 0.34) }),
+  Hungary: merge(T2, { abc1: R(0.24, 0.3, 0.36) }),
+  Poland: T2,
+  Chile: merge(T2, { abc1: R(0.16, 0.22, 0.28), abc1c2: R(0.46, 0.52, 0.58) }),
+  Argentina: merge(T2, { abc1: R(0.14, 0.2, 0.26), abc1c2: R(0.49, 0.55, 0.61) }),
+  UAE: merge(T2, { abc1: R(0.26, 0.32, 0.38) }),
+  "Saudi Arabia": merge(T2, { abc1: R(0.22, 0.28, 0.34) }),
+  Malaysia: merge(T2, { abc1: R(0.22, 0.28, 0.34) }),
 
-  // --- Tier 3: emerging middle-income ---
-  Brazil: merge(TIER3, { abc1: e(22, 0.77), abc1c2: e(58, 0.83) }),
-  Mexico: TIER3,
-  Colombia: merge(TIER3, { abc1: e(18, 0.75), abc1c2: e(50, 0.8) }),
-  Turkey: merge(TIER3, { abc1: e(22, 0.77), abc1c2: e(54, 0.82) }),
-  Thailand: merge(TIER3, {
-    abc1: e(22, 0.77),
-    abc1c2: e(54, 0.82),
-    // Aging faster than peers
-    adults_18_34: e(26, 0.82),
+  // --- Tier 3 ---
+  Brazil: merge(T3, { abc1: R(0.18, 0.22, 0.26), abc1c2: R(0.52, 0.58, 0.64) }),
+  Mexico: T3,
+  Colombia: merge(T3, { abc1: R(0.14, 0.18, 0.22) }),
+  Turkey: merge(T3, { abc1: R(0.18, 0.22, 0.26) }),
+  Thailand: merge(T3, { abc1: R(0.18, 0.22, 0.26) }),
+  Ukraine: merge(T3, { abc1: R(0.14, 0.18, 0.22) }),
+  Romania: merge(T3, { abc1: R(0.14, 0.18, 0.22) }),
+  "South Africa": merge(T3, {
+    abc1: R(0.14, 0.18, 0.22),
+    abc1c2: R(0.39, 0.45, 0.51),
+    abc1c2d: R(0.64, 0.7, 0.76),
   }),
-  Ukraine: merge(TIER3, { abc1: e(18, 0.75), abc1c2: e(50, 0.8) }),
-  Romania: merge(TIER3, { abc1: e(18, 0.75), abc1c2: e(48, 0.8) }),
-  "South Africa": merge(TIER3, {
-    abc1: e(18, 0.75),
-    abc1c2: e(45, 0.8),
-    abc1c2d: e(70, 0.85),
-  }),
-  China: merge(TIER3, {
-    abc1: e(24, 0.77),
-    abc1c2: e(56, 0.83),
-    adults_18_34: e(24, 0.8),
-  }),
+  China: merge(T3, { abc1: R(0.2, 0.24, 0.28) }),
 
-  // --- Tier 4: lower-income emerging ---
-  Peru: merge(TIER4, { abc1: e(14, 0.72) }),
-  India: merge(TIER4, { abc1: e(10, 0.68), abc1c2: e(34, 0.75) }),
-  Indonesia: merge(TIER4, { abc1: e(13, 0.72) }),
-  Philippines: merge(TIER4, { abc1: e(12, 0.7) }),
-  Vietnam: merge(TIER4, { abc1: e(16, 0.73), abc1c2: e(44, 0.8) }),
-  Egypt: merge(TIER4, { abc1: e(12, 0.7) }),
-  Morocco: merge(TIER4, { abc1: e(14, 0.72) }),
-  Nigeria: merge(TIER4, {
-    abc1: e(8, 0.65),
-    abc1c2: e(30, 0.72),
-    abc1c2d: e(58, 0.82),
-    // Very young pyramid
-    adults_18_34: e(38, 0.85),
+  // --- Tier 4 ---
+  Peru: T4,
+  India: merge(T4, { abc1: R(0.06, 0.1, 0.14), abc1c2: R(0.28, 0.34, 0.4) }),
+  Indonesia: T4,
+  Philippines: T4,
+  Vietnam: merge(T4, { abc1: R(0.12, 0.16, 0.2) }),
+  Egypt: T4,
+  Morocco: T4,
+  Nigeria: merge(T4, {
+    abc1: R(0.04, 0.08, 0.12),
+    abc1c2: R(0.24, 0.3, 0.36),
+    abc1c2d: R(0.52, 0.58, 0.64),
   }),
 };
 
-export const MARKETS: string[] = Object.keys(BASE_IR).sort();
+export const MARKETS: string[] = Object.keys(SES_PENETRATION).sort();

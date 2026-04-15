@@ -1,53 +1,94 @@
 /**
- * Shared types for the benchmark tables and the parsed screener criteria object.
+ * Types for the IR Modelling rules engine.
  *
- * The baseIR / modifiers / panelUplift maps are the *only* place IR numbers live.
- * The calculator is pure multiplication against these constants — the LLM never
- * emits an IR, only a typed criteria object used as an index into these tables.
+ * The calculator runs a sequential screening funnel (Rule 2) from a 100%
+ * panel base. Each layer is classified by restriction level (Rule 2) and
+ * has a three-point pass-rate range {low, point, high}. Panel uplift
+ * (Rule 3) is applied selectively — only to category / behavioural /
+ * attitudinal layers, never to clinical prevalence. Market calibration
+ * (Rule 5) adjusts group-level assumptions. Output is a triad
+ * (IR_low, IR_point, IR_high) plus a verdict (Rule 7) and confidence
+ * flag (Rule 8).
  */
 
 export type Market = string;
 
-export type Segment =
-  | "general_population"
-  | "abc1"
-  | "abc1c2"
-  | "abc1c2d"
-  | "women_18_45"
-  | "men_25_54"
-  | "adults_18_34";
+/** Rule 2 restriction-level classification. */
+export type RestrictionLevel = "Broad" | "Medium" | "Narrow" | "VeryNarrow";
 
-export interface BaseIREntry {
-  /** Midpoint / point estimate (percentage, 0–100). */
+/**
+ * A pass-rate range expressed as a decimal fraction 0–1 (e.g. 0.35 = 35%).
+ * Used both for individual layers and for the IR output triad.
+ */
+export interface Range {
+  low: number;
   point: number;
-  /** Conservative lower bound (percentage). */
-  floor: number;
+  high: number;
 }
 
-export type BaseIRTable = Record<Market, Partial<Record<Segment, BaseIREntry>>>;
+/** Panel-uplift class of a layer (Rule 3). */
+export type UpliftClass =
+  | "category_usage" // +20–35%
+  | "brand_ownership" // +20–35% (same bucket as category usage)
+  | "attitudinal" // +15–25%
+  | "behavioural" // +15–25%
+  | "none"; // geo / SES / age / gender / clinical → no panel uplift
 
-export interface ModifierRange {
-  /** Lower bound of the modifier multiplier (applied in conservative floor calc). */
-  min: number;
-  /** Upper bound of the modifier multiplier (applied in the optimistic calc). */
-  max: number;
+/** One layer in the sequential screening funnel. */
+export interface FunnelLayer {
+  label: string;
+  kind: LayerKind;
+  level: RestrictionLevel;
+  passRate: Range; // fraction 0–1 of the PRIOR layer's survivors
+  upliftClass: UpliftClass;
+  source: LayerSource;
+  note?: string;
 }
 
-export interface ModifierTable {
-  category: Record<Category, ModifierRange>;
-  geo: {
-    national: ModifierRange;
-    regions_few: ModifierRange;
-    cities_1: ModifierRange;
-    cities_2_3: ModifierRange;
-    cities_4_10: ModifierRange;
-  };
-  age: Record<AgeBand, ModifierRange>;
-  gender: { all: ModifierRange; male: ModifierRange; female: ModifierRange };
-  condition: Record<ConditionTier, ModifierRange>;
-  income: Record<IncomeTier, ModifierRange>;
+export type LayerKind =
+  | "demographic_geo"
+  | "demographic_age"
+  | "demographic_gender"
+  | "ses"
+  | "category_usage"
+  | "recency"
+  | "frequency"
+  | "brand_owner"
+  | "brand_niche"
+  | "attitudinal"
+  | "condition"
+  | "exclusion"
+  | "other";
+
+export type LayerSource = "benchmark" | "assumed" | "prevalence";
+
+/** Market calibration groups (Rule 5). */
+export type MarketGroup =
+  | "anglo_mature"
+  | "quality_eu"
+  | "latam"
+  | "apac_mea"
+  | "cee_other";
+
+export interface MarketCalibration {
+  /** Multiplier on all category/brand/attitudinal (behavioural) pass rates. */
+  behaviouralAdjust: number;
+  /** Multiplier on SES pass rates. <1 means more restrictive. */
+  sesTighten: number;
+  /** Multiplier on geo pass rates. >1 means less restrictive. */
+  geoLoosen: number;
+  /** Range-widening factor applied to the low/high spread (1.0 = no change). */
+  rangeWidening: number;
+  /** Human-readable note for UI / debug. */
+  note: string;
 }
 
+// -----------------------------------------------------------------------------
+// Parsed criteria shape — extended from the original schema.
+// -----------------------------------------------------------------------------
+
+export type Gender = "male" | "female" | "all";
+export type SesTier = "ABC1" | "ABC1C2" | "ABC1C2D" | "all";
 export type Category =
   | "financial"
   | "fmcg"
@@ -55,38 +96,24 @@ export type Category =
   | "auto"
   | "healthcare"
   | "other";
-
-export type AgeBand =
-  | "all_adults"
-  | "18_24"
-  | "18_34"
-  | "25_54"
-  | "35_54"
-  | "55_plus"
-  | "narrow_custom";
-
-export type ConditionTier =
-  | "none"
-  | "common" // e.g. hypertension
-  | "moderate" // e.g. type-2 diabetes diagnosed
-  | "rare"; // e.g. rare autoimmune
-
-export type IncomeTier = "all" | "mid_plus" | "top_quintile" | "hnwi";
+export type Recency = "P3M" | "P6M" | "P12M" | "ever" | null;
+export type Frequency = "heavy" | "medium" | "light" | null;
+export type BrandSpecificity =
+  | null
+  | "category_only" // any brand in category
+  | "specific_brand" // named or demographic-tight brand
+  | "niche_premium"; // premium / niche / low-share brand
 
 export type PanelType = "online" | "cati" | "f2f" | "hybrid";
-export type ProjectType = "clinical" | "nonclinical";
 
-export type PanelUpliftTable = Record<PanelType, Record<ProjectType, number>>;
-
-/** The Zod-validated object the LLM is required to return. */
 export interface ParsedCriteria {
   market: string | null;
   target_n: number | null;
   assumed_ir: number | null;
   age_min: number | null;
   age_max: number | null;
-  gender: "male" | "female" | "all";
-  seg: "ABC1" | "ABC1C2" | "ABC1C2D" | "all" | null;
+  gender: Gender;
+  seg: SesTier | null;
   category: Category | null;
   geo_restriction: {
     type: "national" | "cities" | "regions";
@@ -99,28 +126,46 @@ export interface ParsedCriteria {
   }>;
   logic: "AND" | "OR";
   panel_type: PanelType | null;
+
+  // New fields (Rule 2 granularity):
+  recency: Recency;
+  frequency: Frequency;
+  brand_specificity: BrandSpecificity;
+  attitudinal: string[];
+  exclusions: string[];
+  clinical: boolean;
+
   notes: string;
 }
 
-export interface AppliedModifier {
-  label: string;
-  range: ModifierRange;
-  source: "exact" | "category_default" | "fallback";
-}
+// -----------------------------------------------------------------------------
+// Output shape.
+// -----------------------------------------------------------------------------
 
-export type Verdict = "ACCEPT" | "REVIEW" | "REJECT";
-export type Confidence = "high" | "medium" | "low";
+export type Verdict = "TOO_HIGH" | "BORDERLINE" | "ACCURATE" | "TOO_LOW";
+export type Confidence = "HIGH" | "MEDIUM" | "LOW";
 
 export interface CalcResult {
   verdict: Verdict;
   confidence: Confidence;
-  final_ir: number;
-  floor_ir: number;
+  confidence_reason: string | null;
+
+  /** IR as a percentage (0–100) for UI display. */
+  ir_low: number;
+  ir_point: number;
+  ir_high: number;
   assumed_ir: number | null;
-  modifiers_applied: AppliedModifier[];
-  base_segment: Segment;
-  panel_type: PanelType;
-  uplift: number;
-  risk_flag: boolean;
+
+  layers: FunnelLayer[];
+
+  /** Aggregate uplift multiplier actually applied (1.0 = none). */
+  panel_uplift: number;
+  panel_uplift_reason: string;
+
+  /** Market calibration resolved for the target market. */
+  market_group: MarketGroup;
+  market_calibration: MarketCalibration;
+
+  short_reason: string;
   notes: string[];
 }
