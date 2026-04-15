@@ -14,11 +14,34 @@ export async function POST(req: Request) {
   const username = (body.username ?? "").toString();
   const password = (body.password ?? "").toString();
 
+  if (!process.env.APP_USERNAME || !process.env.APP_PASSWORD) {
+    return NextResponse.json(
+      {
+        error:
+          "server misconfigured: APP_USERNAME / APP_PASSWORD env vars are not set",
+      },
+      { status: 500 },
+    );
+  }
+
   if (!checkCredentials(username, password)) {
     return NextResponse.json({ error: "invalid credentials" }, { status: 401 });
   }
 
-  const { value, maxAge } = await signSession(username);
+  let value: string;
+  let maxAge: number;
+  try {
+    ({ value, maxAge } = await signSession(username));
+  } catch (err) {
+    return NextResponse.json(
+      {
+        error:
+          "server misconfigured: " +
+          ((err as Error).message ?? "SESSION_SECRET env var missing"),
+      },
+      { status: 500 },
+    );
+  }
   const res = NextResponse.json({ ok: true });
   res.cookies.set({
     name: SESSION_COOKIE,
