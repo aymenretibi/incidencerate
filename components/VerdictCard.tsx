@@ -51,7 +51,7 @@ export function VerdictCard({ result }: { result: CalcResult }) {
       <p className="mt-2 text-sm text-white/70">{s.description}</p>
 
       <div className="mt-6 grid grid-cols-4 gap-4">
-        <Stat label="Estimated IR" value={fmt(result.ir_point)} emphasis />
+        <Stat label="IR remaining" value={fmt(result.ir_point)} emphasis />
         <Stat label="Low" value={fmt(result.ir_low)} />
         <Stat label="High" value={fmt(result.ir_high)} />
         <Stat

@@ -150,25 +150,61 @@ function buildAgeLayer(p: ParsedCriteria): FunnelLayer | null {
   if (age_min == null && age_max == null) return null;
 
   const lo = age_min ?? 18;
-  const hi = age_max ?? 99;
+  const hi = age_max ?? 80;
+  // "All adults" is 18–80 for our purposes. Skip when the band covers it.
+  if (lo <= 18 && hi >= 75) return null;
+
   const span = hi - lo;
 
-  let key: keyof typeof AGE_BANDS;
-  if (span <= 6) key = "narrow_custom";
-  else if (lo >= 18 && hi <= 24) key = "18_24";
-  else if (lo >= 18 && hi <= 34) key = "18_34";
-  else if (lo >= 25 && hi <= 54) key = "25_54";
-  else if (lo >= 35 && hi <= 54) key = "35_54";
-  else if (lo >= 55) key = "55_plus";
-  else key = "all_adults";
+  // Preset bands (anchored to UN median across our 42-market set).
+  let base: Range | null = null;
+  let key = "";
+  if (span <= 6) {
+    base = AGE_BANDS.narrow_custom;
+    key = "narrow_custom";
+  } else if (lo >= 18 && hi <= 24) {
+    base = AGE_BANDS["18_24"];
+    key = "18_24";
+  } else if (lo >= 18 && hi <= 34) {
+    base = AGE_BANDS["18_34"];
+    key = "18_34";
+  } else if (lo >= 25 && hi <= 54) {
+    base = AGE_BANDS["25_54"];
+    key = "25_54";
+  } else if (lo >= 35 && hi <= 54) {
+    base = AGE_BANDS["35_54"];
+    key = "35_54";
+  } else if (lo >= 55) {
+    base = AGE_BANDS["55_plus"];
+    key = "55_plus";
+  }
 
-  if (key === "all_adults") return null;
+  // No preset fits — build a linear approximation against the adult span
+  // (18–80). Slight concavity: narrower spans pass proportionally fewer
+  // people because the tails (18–24 and 70+) are thinner.
+  if (!base) {
+    const ADULT_SPAN = 80 - 18;
+    const clampedLo = Math.max(18, lo);
+    const clampedHi = Math.min(80, hi);
+    const frac = Math.max(0.05, (clampedHi - clampedLo) / ADULT_SPAN);
+    // ±15% uncertainty around the linear point.
+    base = {
+      low: Math.max(0.02, frac * 0.85),
+      point: frac,
+      high: Math.min(1, frac * 1.15),
+    };
+    key = "linear";
+  }
+
   return layer(
     "demographic_age",
-    `Age ${lo}–${hi === 99 ? "+" : hi}`,
-    AGE_BANDS[key],
+    `Age ${lo}–${hi === 80 || age_max == null ? "+" : hi}`,
+    base,
     "none",
-    "benchmark",
+    key === "linear" ? "assumed" : "benchmark",
+    key === "linear"
+      ? "Custom age span — linear approximation against 18–80 adult base."
+      : undefined,
   );
 }
 
@@ -211,11 +247,13 @@ function buildCategoryLayer(p: ParsedCriteria): FunnelLayer | null {
   if (!p.category || p.category === "other") return null;
   if (p.clinical) return null; // condition layer handles it instead
 
-  const hasCategoryBehaviour = p.qualifiers.some((q) => q.kind === "behaviour");
-  if (!hasCategoryBehaviour && !p.recency) return null;
-
+  // Fire whenever a category is specified. Without explicit recency or a
+  // behaviour qualifier we default to CATEGORY_EVER (broadest band) and tag
+  // the layer as assumed so Rule 8 surfaces it in confidence.
   let base: Range;
   let label: string;
+  const hasCategoryBehaviour = p.qualifiers.some((q) => q.kind === "behaviour");
+
   if (p.recency === "P3M" || p.frequency === "heavy") {
     base = CATEGORY_P3M;
     label = `Category buyer/user P3M (${p.category})`;
@@ -225,9 +263,12 @@ function buildCategoryLayer(p: ParsedCriteria): FunnelLayer | null {
   } else if (p.recency === "ever") {
     base = CATEGORY_EVER;
     label = `Category ever-used (${p.category})`;
-  } else {
+  } else if (hasCategoryBehaviour) {
     base = CATEGORY_P12M;
     label = `Category user (${p.category}, unspecified recency)`;
+  } else {
+    base = CATEGORY_EVER;
+    label = `Category scope: ${p.category} (no recency / behaviour specified)`;
   }
 
   return layer("category_usage", label, base, "category_usage", "assumed");

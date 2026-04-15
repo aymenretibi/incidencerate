@@ -9,11 +9,31 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const BodySchema = z.object({
-  screener: z.string().min(10),
+  screener: z.string().optional().default(""),
   market: z.string().min(1),
-  panel_type: z.enum(["online", "cati", "f2f", "hybrid"]),
+  panel_type: z.enum(["online", "cati", "f2f", "hybrid"]).default("online"),
   assumed_ir: z.number().min(0).max(100).optional(),
   target_n: z.number().int().positive().optional(),
+
+  // Structured intake — authoritative over LLM extraction.
+  age_min: z.number().int().min(0).max(120).nullable().optional(),
+  age_max: z.number().int().min(0).max(120).nullable().optional(),
+  gender: z.enum(["male", "female", "all"]).optional(),
+  seg: z.enum(["ABC1", "ABC1C2", "ABC1C2D", "all"]).nullable().optional(),
+  category: z
+    .enum(["financial", "fmcg", "tech", "auto", "healthcare", "other"])
+    .nullable()
+    .optional(),
+  geo_type: z.enum(["national", "cities", "regions"]).optional(),
+  cities: z.array(z.string()).optional(),
+  recency: z.enum(["P3M", "P6M", "P12M", "ever"]).nullable().optional(),
+  frequency: z.enum(["heavy", "medium", "light"]).nullable().optional(),
+  brand_specificity: z
+    .enum(["category_only", "specific_brand", "niche_premium"])
+    .nullable()
+    .optional(),
+  logic: z.enum(["AND", "OR"]).optional(),
+  clinical: z.boolean().optional(),
 });
 
 export async function POST(req: Request) {
@@ -32,7 +52,25 @@ export async function POST(req: Request) {
     );
   }
 
-  const { screener, market, panel_type, assumed_ir, target_n } = parsed.data;
+  const {
+    screener,
+    market,
+    panel_type,
+    assumed_ir,
+    target_n,
+    age_min,
+    age_max,
+    gender,
+    seg,
+    category,
+    geo_type,
+    cities,
+    recency,
+    frequency,
+    brand_specificity,
+    logic,
+    clinical,
+  } = parsed.data;
 
   if (!SES_PENETRATION[market]) {
     return NextResponse.json(
@@ -41,32 +79,85 @@ export async function POST(req: Request) {
     );
   }
 
-  const llm = await parseScreener(screener, {
-    market,
-    assumedIR: assumed_ir,
-    targetN: target_n,
-    panelType: panel_type,
-  });
+  // Only call the LLM if the user supplied free-text for attitudinal /
+  // condition / exclusion extraction. Structured intake fields are
+  // authoritative; the LLM is for the soft stuff only.
+  const hasScreenerText = screener.trim().length >= 10;
 
-  if (!llm.ok || !llm.data) {
-    return NextResponse.json(
-      {
-        error: "parser_failed",
-        detail: llm.error ?? "unknown",
-        raw: llm.raw,
-      },
-      { status: 422 },
-    );
+  let llmData: ParsedCriteria | null = null;
+  if (hasScreenerText) {
+    const llm = await parseScreener(screener, {
+      market,
+      assumedIR: assumed_ir,
+      targetN: target_n,
+      panelType: panel_type,
+    });
+    if (!llm.ok || !llm.data) {
+      return NextResponse.json(
+        {
+          error: "parser_failed",
+          detail: llm.error ?? "unknown",
+          raw: llm.raw,
+        },
+        { status: 422 },
+      );
+    }
+    llmData = llm.data as ParsedCriteria;
   }
 
-  // UI values override LLM extraction for market/assumed_ir/panel — the UI
-  // is authoritative for those fields.
+  const empty: ParsedCriteria = {
+    market: null,
+    target_n: null,
+    assumed_ir: null,
+    age_min: null,
+    age_max: null,
+    gender: "all",
+    seg: null,
+    category: null,
+    geo_restriction: { type: "national" },
+    qualifiers: [],
+    logic: "AND",
+    panel_type: null,
+    recency: null,
+    frequency: null,
+    brand_specificity: null,
+    attitudinal: [],
+    exclusions: [],
+    clinical: false,
+    notes: "",
+  };
+
+  const llmOrEmpty = llmData ?? empty;
+
+  // Structured intake fields override the LLM. The LLM's contribution
+  // is attitudinal / exclusions / qualifiers (condition/ownership/
+  // behaviour) and `notes`.
+  const geo: ParsedCriteria["geo_restriction"] =
+    geo_type === "cities" && cities && cities.length > 0
+      ? { type: "cities", cities, count: cities.length }
+      : geo_type === "regions"
+      ? { type: "regions" }
+      : geo_type === "national"
+      ? { type: "national" }
+      : llmOrEmpty.geo_restriction;
+
   const criteria: ParsedCriteria = {
-    ...(llm.data as ParsedCriteria),
+    ...llmOrEmpty,
     market,
     panel_type,
-    assumed_ir: assumed_ir ?? llm.data.assumed_ir,
-    target_n: target_n ?? llm.data.target_n,
+    assumed_ir: assumed_ir ?? llmOrEmpty.assumed_ir,
+    target_n: target_n ?? llmOrEmpty.target_n,
+    age_min: age_min ?? llmOrEmpty.age_min,
+    age_max: age_max ?? llmOrEmpty.age_max,
+    gender: gender ?? llmOrEmpty.gender,
+    seg: seg ?? llmOrEmpty.seg,
+    category: category ?? llmOrEmpty.category,
+    geo_restriction: geo,
+    recency: recency ?? llmOrEmpty.recency,
+    frequency: frequency ?? llmOrEmpty.frequency,
+    brand_specificity: brand_specificity ?? llmOrEmpty.brand_specificity,
+    logic: logic ?? llmOrEmpty.logic,
+    clinical: clinical ?? llmOrEmpty.clinical,
   };
 
   try {
