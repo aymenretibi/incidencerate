@@ -1,17 +1,17 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { calibrateIR } from "@/lib/irCalibrator";
+import { chatIR } from "@/lib/irCalibrator";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const BodySchema = z.object({
-  cs_description: z.string().min(3),
-  market: z.string().min(1),
-  assumed_ir: z.number().min(0).max(100),
+const MessageSchema = z.object({
+  role: z.enum(["user", "assistant"]),
+  content: z.string().min(1),
+});
 
-  // Optional structured overrides — applied only when the user is
-  // unhappy with the AI's first answer and nudges specific inputs.
+const BodySchema = z.object({
+  messages: z.array(MessageSchema).min(1).max(40),
   overrides: z
     .object({
       age_min: z.number().int().min(0).max(120).nullable().optional(),
@@ -51,21 +51,25 @@ export async function POST(req: Request) {
     );
   }
 
-  const { cs_description, market, assumed_ir, overrides } = parsed.data;
+  const last = parsed.data.messages[parsed.data.messages.length - 1];
+  if (last.role !== "user") {
+    return NextResponse.json(
+      { error: "last message must be from user" },
+      { status: 400 },
+    );
+  }
 
-  const res = await calibrateIR({
-    cs_description,
-    market,
-    assumed_ir,
-    overrides,
+  const res = await chatIR({
+    messages: parsed.data.messages,
+    overrides: parsed.data.overrides,
   });
 
-  if (!res.ok || !res.data) {
+  if (!res.ok || !res.reply) {
     return NextResponse.json(
       { error: "calibrator_failed", detail: res.error ?? "unknown", raw: res.raw },
       { status: 422 },
     );
   }
 
-  return NextResponse.json({ ok: true, result: res.data });
+  return NextResponse.json({ ok: true, reply: res.reply });
 }

@@ -180,40 +180,82 @@ Rules enforced via the JSON contract:
 - Do not include any field not listed above.
 - Never reference panels in any text field (Rule 3 language note).`;
 
+const IR_RESULT_PROPERTIES = {
+  market: { type: SchemaType.STRING },
+  sample_title: { type: SchemaType.STRING },
+  predicted_ir_point: { type: SchemaType.NUMBER },
+  predicted_ir_low: { type: SchemaType.NUMBER },
+  predicted_ir_high: { type: SchemaType.NUMBER },
+  verdict: {
+    type: SchemaType.STRING,
+    enum: ["TOO_HIGH", "TOO_LOW", "ACCURATE", "BORDERLINE"],
+  },
+  assumed_ir: { type: SchemaType.NUMBER },
+  sample_description: { type: SchemaType.STRING },
+  short_reason: { type: SchemaType.STRING },
+  assumption_confidence: {
+    type: SchemaType.STRING,
+    enum: ["HIGH", "MEDIUM", "LOW"],
+  },
+  confidence_reason: { type: SchemaType.STRING, nullable: true },
+};
+
+const IR_RESULT_REQUIRED = [
+  "market",
+  "sample_title",
+  "predicted_ir_point",
+  "predicted_ir_low",
+  "predicted_ir_high",
+  "verdict",
+  "assumed_ir",
+  "sample_description",
+  "short_reason",
+  "assumption_confidence",
+];
+
 const RESPONSE_SCHEMA = {
   type: SchemaType.OBJECT,
-  properties: {
-    market: { type: SchemaType.STRING },
-    sample_title: { type: SchemaType.STRING },
-    predicted_ir_point: { type: SchemaType.NUMBER },
-    predicted_ir_low: { type: SchemaType.NUMBER },
-    predicted_ir_high: { type: SchemaType.NUMBER },
-    verdict: {
-      type: SchemaType.STRING,
-      enum: ["TOO_HIGH", "TOO_LOW", "ACCURATE", "BORDERLINE"],
-    },
-    assumed_ir: { type: SchemaType.NUMBER },
-    sample_description: { type: SchemaType.STRING },
-    short_reason: { type: SchemaType.STRING },
-    assumption_confidence: {
-      type: SchemaType.STRING,
-      enum: ["HIGH", "MEDIUM", "LOW"],
-    },
-    confidence_reason: { type: SchemaType.STRING, nullable: true },
-  },
-  required: [
-    "market",
-    "sample_title",
-    "predicted_ir_point",
-    "predicted_ir_low",
-    "predicted_ir_high",
-    "verdict",
-    "assumed_ir",
-    "sample_description",
-    "short_reason",
-    "assumption_confidence",
-  ],
+  properties: IR_RESULT_PROPERTIES,
+  required: IR_RESULT_REQUIRED,
 };
+
+const CHAT_RESPONSE_SCHEMA = {
+  type: SchemaType.OBJECT,
+  properties: {
+    kind: { type: SchemaType.STRING, enum: ["question", "assessment"] },
+    text: { type: SchemaType.STRING, nullable: true },
+    assessment: {
+      type: SchemaType.OBJECT,
+      nullable: true,
+      properties: IR_RESULT_PROPERTIES,
+    },
+  },
+  required: ["kind"],
+};
+
+const CHAT_ADDENDUM = `
+
+CHATBOT MODE
+You are deployed as a conversational validator inside a chat UI. Talk to the user naturally — short, professional, plain English.
+
+The three required inputs (Custom Sample Description, Market, Assumed IR) may arrive gradually across multiple turns. Maintain memory of everything the user has told you so far in the conversation.
+
+If any of the three inputs is still missing after the latest user message, set kind="question" and put a short, specific follow-up in "text" — ask only for what's missing. Do not guess or validate partial input. Do not produce an assessment until you have all three.
+
+As soon as you have all three inputs (anywhere in the conversation), set kind="assessment", run the full v2.5.1 calibration internally, and populate the "assessment" object per the OUTPUT CONTRACT. "text" may hold a brief one-line acknowledgement but must not duplicate the card's fields.
+
+On follow-up turns ("what if ages 25–54?", "assume only women"), re-run calibration with the new constraint and return a fresh assessment.
+
+If the user message contains a USER OVERRIDES block, those constraints are authoritative — honour them when reconstructing the funnel.
+
+CHAT OUTPUT CONTRACT
+Return a SINGLE JSON object:
+{
+  "kind": "question" | "assessment",
+  "text": string | null,              // conversational reply; required when kind="question"
+  "assessment": IRResult | null       // required when kind="assessment", same shape as the base OUTPUT CONTRACT
+}
+No prose, no markdown, no code fences.`;
 
 export const IRResultSchema = z.object({
   market: z.string(),
@@ -355,4 +397,125 @@ Produce the JSON object per the OUTPUT CONTRACT. Temperature is 0; be determinis
     return { ok: false, raw, error: validated.error.message };
   }
   return { ok: true, data: validated.data };
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * Chat mode — the primary path the UI uses.
+ * The LLM owns memory across turns, asks follow-ups when inputs are missing,
+ * and returns a discriminated { kind: "question" | "assessment" } payload.
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+export type ChatRole = "user" | "assistant";
+
+export interface ChatTurn {
+  role: ChatRole;
+  content: string;
+}
+
+export const ChatReplySchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("question"),
+    text: z.string().min(1),
+    assessment: z.null().optional(),
+  }),
+  z.object({
+    kind: z.literal("assessment"),
+    text: z.string().nullable().optional(),
+    assessment: IRResultSchema,
+  }),
+]);
+
+export type ChatReply = z.infer<typeof ChatReplySchema>;
+
+export interface ChatInput {
+  messages: ChatTurn[];
+  overrides?: CalibratorInput["overrides"];
+}
+
+export interface ChatResponse {
+  ok: boolean;
+  reply?: ChatReply;
+  raw?: string;
+  error?: string;
+}
+
+export async function chatIR(input: ChatInput): Promise<ChatResponse> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return { ok: false, error: "GEMINI_API_KEY not set" };
+  if (input.messages.length === 0) {
+    return { ok: false, error: "no messages provided" };
+  }
+
+  const modelName = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+  const client = new GoogleGenerativeAI(apiKey);
+
+  // Split off the latest user message (Gemini's sendMessage expects the tail).
+  const history = input.messages.slice(0, -1).map((m) => ({
+    role: m.role === "assistant" ? ("model" as const) : ("user" as const),
+    parts: [{ text: m.content }],
+  }));
+  const latest = input.messages[input.messages.length - 1];
+  if (latest.role !== "user") {
+    return { ok: false, error: "last message must be from user" };
+  }
+
+  const ov = overrideBlock(input.overrides);
+  const latestMessage = ov ? `${latest.content}${ov}` : latest.content;
+
+  async function callModel(useResponseSchema: boolean): Promise<string> {
+    const model = client.getGenerativeModel({
+      model: modelName,
+      systemInstruction: SYSTEM_INSTRUCTION + CHAT_ADDENDUM,
+      generationConfig: {
+        temperature: 0,
+        responseMimeType: "application/json",
+        ...(useResponseSchema
+          ? { responseSchema: CHAT_RESPONSE_SCHEMA as unknown as object }
+          : {}),
+      },
+    });
+    const chat = model.startChat({ history });
+    const result = await chat.sendMessage(latestMessage);
+    return result.response.text();
+  }
+
+  let raw = "";
+  try {
+    raw = await callModel(true);
+  } catch {
+    try {
+      raw = await callModel(false);
+    } catch (err2) {
+      return { ok: false, error: (err2 as Error).message };
+    }
+  }
+
+  const cleaned = raw
+    .trim()
+    .replace(/^```(?:json)?/i, "")
+    .replace(/```$/, "")
+    .trim();
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    return { ok: false, raw, error: "LLM returned non-JSON" };
+  }
+
+  // Normalise: coerce empty-string text on assessments to null; drop stray
+  // assessment fields on question replies. Gemini occasionally emits both.
+  if (
+    parsed &&
+    typeof parsed === "object" &&
+    (parsed as { kind?: unknown }).kind === "question"
+  ) {
+    (parsed as { assessment?: unknown }).assessment = null;
+  }
+
+  const validated = ChatReplySchema.safeParse(parsed);
+  if (!validated.success) {
+    return { ok: false, raw, error: validated.error.message };
+  }
+  return { ok: true, reply: validated.data };
 }
