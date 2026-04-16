@@ -238,24 +238,45 @@ const CHAT_ADDENDUM = `
 CHATBOT MODE
 You are deployed as a conversational validator inside a chat UI. Talk to the user naturally — short, professional, plain English.
 
-The three required inputs (Custom Sample Description, Market, Assumed IR) may arrive gradually across multiple turns. Maintain memory of everything the user has told you so far in the conversation.
+The three required inputs (Custom Sample Description, Market, Assumed IR) may arrive gradually across multiple turns. Maintain memory of everything the user has told you so far.
 
-If any of the three inputs is still missing after the latest user message, set kind="question" and put a short, specific follow-up in "text" — ask only for what's missing. Do not guess or validate partial input. Do not produce an assessment until you have all three.
+If any of the three inputs is still missing after the latest user message, set "kind": "question" and put a short, specific follow-up in "text" — ask only for what is missing. Do not guess or validate partial input.
 
-As soon as you have all three inputs (anywhere in the conversation), set kind="assessment", run the full v2.5.1 calibration internally, and populate the "assessment" object per the OUTPUT CONTRACT. "text" may hold a brief one-line acknowledgement but must not duplicate the card's fields.
+As soon as you have all three inputs (anywhere in the conversation), set "kind": "assessment", run the full v2.5.1 calibration internally, and populate the "assessment" object per the base OUTPUT CONTRACT. "text" may hold a brief one-line acknowledgement; the card carries the answer.
 
 On follow-up turns ("what if ages 25–54?", "assume only women"), re-run calibration with the new constraint and return a fresh assessment.
 
-If the user message contains a USER OVERRIDES block, those constraints are authoritative — honour them when reconstructing the funnel.
+If the user message contains a USER OVERRIDES block, those constraints are authoritative.
 
 CHAT OUTPUT CONTRACT
-Return a SINGLE JSON object:
+Return EXACTLY one JSON object. No prose, no markdown, no code fences, no commentary — only JSON.
+
+When asking a follow-up, return this shape (omit "assessment"):
 {
-  "kind": "question" | "assessment",
-  "text": string | null,              // conversational reply; required when kind="question"
-  "assessment": IRResult | null       // required when kind="assessment", same shape as the base OUTPUT CONTRACT
+  "kind": "question",
+  "text": "Which market is this sample for, and what IR did you assume?"
 }
-No prose, no markdown, no code fences.`;
+
+When giving a validation, return this shape (include every field of the base IRResult under "assessment"):
+{
+  "kind": "assessment",
+  "text": "Here's the validation:",
+  "assessment": {
+    "market": "UK",
+    "sample_title": "Premium EV Owners",
+    "predicted_ir_point": 4.8,
+    "predicted_ir_low": 2.5,
+    "predicted_ir_high": 6.5,
+    "verdict": "TOO_HIGH",
+    "assumed_ir": 12,
+    "sample_description": "Adults who own a premium EV purchased in the last 3 years.",
+    "short_reason": "Premium EV ownership + recency filter make 12% unrealistic in a general population.",
+    "assumption_confidence": "MEDIUM",
+    "confidence_reason": "ownership rate assumed, no benchmark available"
+  }
+}
+
+Never mix the two shapes. Never emit the word "null" for the assessment field — simply omit it when kind="question".`;
 
 export const IRResultSchema = z.object({
   market: z.string(),
@@ -439,6 +460,57 @@ export interface ChatResponse {
   error?: string;
 }
 
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(
+      () => reject(new Error(`${label} timed out after ${ms}ms`)),
+      ms,
+    );
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      },
+    );
+  });
+}
+
+// Pull the first balanced JSON object out of a string, even if the model
+// added stray prose, XML-ish tags, or code fences around it.
+function extractJsonObject(text: string): string | null {
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
 export async function chatIR(input: ChatInput): Promise<ChatResponse> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return { ok: false, error: "GEMINI_API_KEY not set" };
@@ -449,7 +521,6 @@ export async function chatIR(input: ChatInput): Promise<ChatResponse> {
   const modelName = process.env.GEMINI_MODEL || "gemini-2.5-flash";
   const client = new GoogleGenerativeAI(apiKey);
 
-  // Split off the latest user message (Gemini's sendMessage expects the tail).
   const history = input.messages.slice(0, -1).map((m) => ({
     role: m.role === "assistant" ? ("model" as const) : ("user" as const),
     parts: [{ text: m.content }],
@@ -462,60 +533,88 @@ export async function chatIR(input: ChatInput): Promise<ChatResponse> {
   const ov = overrideBlock(input.overrides);
   const latestMessage = ov ? `${latest.content}${ov}` : latest.content;
 
-  async function callModel(useResponseSchema: boolean): Promise<string> {
-    const model = client.getGenerativeModel({
-      model: modelName,
-      systemInstruction: SYSTEM_INSTRUCTION + CHAT_ADDENDUM,
-      generationConfig: {
-        temperature: 0,
-        responseMimeType: "application/json",
-        ...(useResponseSchema
-          ? { responseSchema: CHAT_RESPONSE_SCHEMA as unknown as object }
-          : {}),
-      },
-    });
-    const chat = model.startChat({ history });
-    const result = await chat.sendMessage(latestMessage);
-    return result.response.text();
-  }
+  const started = Date.now();
+
+  // responseSchema with a nullable nested OBJECT is unreliable across Gemini
+  // model families (and unsupported on Gemma). Rely on the prompt-level JSON
+  // contract + responseMimeType and post-process defensively.
+  const model = client.getGenerativeModel({
+    model: modelName,
+    systemInstruction: SYSTEM_INSTRUCTION + CHAT_ADDENDUM,
+    generationConfig: {
+      temperature: 0,
+      responseMimeType: "application/json",
+    },
+  });
 
   let raw = "";
   try {
-    raw = await callModel(true);
-  } catch {
-    try {
-      raw = await callModel(false);
-    } catch (err2) {
-      return { ok: false, error: (err2 as Error).message };
-    }
+    const chat = model.startChat({ history });
+    const result = await withTimeout(
+      chat.sendMessage(latestMessage),
+      50_000,
+      `Gemini (${modelName})`,
+    );
+    raw = result.response.text() ?? "";
+  } catch (err) {
+    const msg = (err as Error).message;
+    console.error("[chatIR] model call failed", {
+      model: modelName,
+      ms: Date.now() - started,
+      err: msg,
+    });
+    return { ok: false, error: msg };
   }
 
-  const cleaned = raw
-    .trim()
-    .replace(/^```(?:json)?/i, "")
-    .replace(/```$/, "")
-    .trim();
+  if (!raw || raw.trim().length === 0) {
+    console.error("[chatIR] empty response from model", { model: modelName });
+    return { ok: false, error: "empty response from model" };
+  }
+
+  const candidate =
+    extractJsonObject(raw) ??
+    raw
+      .trim()
+      .replace(/^```(?:json)?/i, "")
+      .replace(/```$/, "")
+      .trim();
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(cleaned);
+    parsed = JSON.parse(candidate);
   } catch {
+    console.error("[chatIR] non-JSON response", {
+      model: modelName,
+      preview: raw.slice(0, 400),
+    });
     return { ok: false, raw, error: "LLM returned non-JSON" };
   }
 
-  // Normalise: coerce empty-string text on assessments to null; drop stray
-  // assessment fields on question replies. Gemini occasionally emits both.
-  if (
-    parsed &&
-    typeof parsed === "object" &&
-    (parsed as { kind?: unknown }).kind === "question"
-  ) {
-    (parsed as { assessment?: unknown }).assessment = null;
+  // Normalise a few common shape-drift cases the model may produce.
+  if (parsed && typeof parsed === "object") {
+    const p = parsed as Record<string, unknown>;
+    if (p.kind === "question") {
+      delete p.assessment;
+    }
+    if (p.kind === "assessment" && typeof p.text !== "string") {
+      p.text = null;
+    }
   }
 
   const validated = ChatReplySchema.safeParse(parsed);
   if (!validated.success) {
+    console.error("[chatIR] schema validation failed", {
+      model: modelName,
+      zod: validated.error.message,
+      preview: raw.slice(0, 400),
+    });
     return { ok: false, raw, error: validated.error.message };
   }
+
+  console.info("[chatIR] ok", {
+    model: modelName,
+    ms: Date.now() - started,
+    kind: validated.data.kind,
+  });
   return { ok: true, reply: validated.data };
 }

@@ -205,6 +205,8 @@ export function CalculatorForm({ markets }: Props) {
     setError(null);
     setPending(true);
 
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 58_000);
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
@@ -219,6 +221,7 @@ export function CalculatorForm({ markets }: Props) {
           })),
           overrides,
         }),
+        signal: ac.signal,
       });
       const data = (await res.json()) as ChatSuccess | ChatFailure;
       if (!res.ok || !("ok" in data && data.ok)) {
@@ -245,8 +248,16 @@ export function CalculatorForm({ markets }: Props) {
         ]);
       }
     } catch (err) {
-      setError({ error: "network_error", detail: (err as Error).message });
+      const e = err as Error;
+      setError({
+        error: e.name === "AbortError" ? "request_timeout" : "network_error",
+        detail:
+          e.name === "AbortError"
+            ? "The AI took longer than 58s to reply. Check server logs or try again."
+            : e.message,
+      });
     } finally {
+      clearTimeout(timer);
       setPending(false);
     }
   }

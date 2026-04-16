@@ -4,6 +4,9 @@ import { chatIR } from "@/lib/irCalibrator";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
+// Allow up to 60s for multi-turn Gemini calls. On Vercel Hobby this caps at
+// 60s anyway; on Pro this lifts the default 10s serverless timeout.
+export const maxDuration = 60;
 
 const MessageSchema = z.object({
   role: z.enum(["user", "assistant"]),
