@@ -393,16 +393,19 @@ Produce the JSON object per the OUTPUT CONTRACT. Temperature is 0; be determinis
     }
   }
 
-  const cleaned = raw
-    .trim()
-    .replace(/^```(?:json)?/i, "")
-    .replace(/```$/, "")
-    .trim();
+  const cleaned =
+    extractJsonObject(raw) ??
+    raw
+      .trim()
+      .replace(/^```(?:json)?/i, "")
+      .replace(/```$/, "")
+      .trim();
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(cleaned);
   } catch {
+    console.error("[calibrateIR] non-JSON response", raw.slice(0, 500));
     return { ok: false, raw, error: "LLM returned non-JSON" };
   }
 
