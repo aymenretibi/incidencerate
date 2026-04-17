@@ -376,7 +376,7 @@ Produce the JSON object per the OUTPUT CONTRACT. Temperature is 0; be determinis
     });
     const result = await withTimeout(
       model.generateContent(userMessage),
-      30_000,
+      45_000,
       `Gemini calibrate (${modelName}, schema=${useResponseSchema})`,
     );
     return result.response.text();
@@ -385,10 +385,7 @@ Produce the JSON object per the OUTPUT CONTRACT. Temperature is 0; be determinis
   let raw = "";
   try {
     raw = await callModel(true);
-  } catch (err1) {
-    if ((err1 as Error).message?.includes("timed out")) {
-      return { ok: false, error: (err1 as Error).message };
-    }
+  } catch {
     try {
       raw = await callModel(false);
     } catch (err2) {
@@ -712,7 +709,7 @@ async function extractInputs(
     const chat = model.startChat({ history });
     const result = await withTimeout(
       chat.sendMessage(latest.content),
-      18_000,
+      25_000,
       `Gemini extract (${modelName})`,
     );
     raw = result.response.text() ?? "";
