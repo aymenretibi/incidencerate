@@ -1,4 +1,5 @@
 import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
+import { createHash } from "node:crypto";
 import { z } from "zod";
 
 /**
@@ -219,64 +220,49 @@ const RESPONSE_SCHEMA = {
   required: IR_RESULT_REQUIRED,
 };
 
-const CHAT_RESPONSE_SCHEMA = {
+/**
+ * Extract phase — small, prompt with no IR rules. Its only job is to read the
+ * conversation and return either a follow-up question or the three structured
+ * inputs (with implied overrides) ready for the deterministic calibrate call.
+ */
+const EXTRACT_SYSTEM_INSTRUCTION = `You are an input extractor for an IR calibration chatbot.
+
+Your only job: read the conversation and decide whether the user has supplied all three required inputs:
+  1. Custom Sample Description (free text describing the qualifying population)
+  2. Market (a country / region name)
+  3. Assumed IR (a percentage 0–100)
+
+If any are missing, return {"kind":"question", "question":"<short specific follow-up asking only for what is missing>"}.
+
+If all three are present (gathered across any number of turns — combine information freely), return {"kind":"inputs", ...} with the structured fields populated. Echo the user's wording for cs_description (lightly cleaned). Use the canonical market name (e.g. "UK" not "the United Kingdom"). assumed_ir is a number, not a string with %.
+
+If the user explicitly mentioned constraints that map onto known overrides (age range, gender, SES segment, geography type, category, recency, frequency, brand specificity, AND/OR logic, clinical), populate the matching override_* fields. Leave any not mentioned as null. Do NOT invent constraints.
+
+Output one JSON object only. No prose, no code fences.`;
+
+const EXTRACT_SCHEMA = {
   type: SchemaType.OBJECT,
   properties: {
-    kind: { type: SchemaType.STRING, enum: ["question", "assessment"] },
-    text: { type: SchemaType.STRING, nullable: true },
-    assessment: {
-      type: SchemaType.OBJECT,
-      nullable: true,
-      properties: IR_RESULT_PROPERTIES,
-    },
+    kind: { type: SchemaType.STRING, enum: ["question", "inputs"] },
+    question: { type: SchemaType.STRING, nullable: true },
+    cs_description: { type: SchemaType.STRING, nullable: true },
+    market: { type: SchemaType.STRING, nullable: true },
+    assumed_ir: { type: SchemaType.NUMBER, nullable: true },
+    override_age_min: { type: SchemaType.NUMBER, nullable: true },
+    override_age_max: { type: SchemaType.NUMBER, nullable: true },
+    override_gender: { type: SchemaType.STRING, nullable: true },
+    override_seg: { type: SchemaType.STRING, nullable: true },
+    override_geo_type: { type: SchemaType.STRING, nullable: true },
+    override_category: { type: SchemaType.STRING, nullable: true },
+    override_recency: { type: SchemaType.STRING, nullable: true },
+    override_frequency: { type: SchemaType.STRING, nullable: true },
+    override_brand_specificity: { type: SchemaType.STRING, nullable: true },
+    override_logic: { type: SchemaType.STRING, nullable: true },
+    override_clinical: { type: SchemaType.BOOLEAN, nullable: true },
+    override_extra_notes: { type: SchemaType.STRING, nullable: true },
   },
   required: ["kind"],
 };
-
-const CHAT_ADDENDUM = `
-
-CHATBOT MODE
-You are deployed as a conversational validator inside a chat UI. Talk to the user naturally — short, professional, plain English.
-
-The three required inputs (Custom Sample Description, Market, Assumed IR) may arrive gradually across multiple turns. Maintain memory of everything the user has told you so far.
-
-If any of the three inputs is still missing after the latest user message, set "kind": "question" and put a short, specific follow-up in "text" — ask only for what is missing. Do not guess or validate partial input.
-
-As soon as you have all three inputs (anywhere in the conversation), set "kind": "assessment", run the full v2.5.1 calibration internally, and populate the "assessment" object per the base OUTPUT CONTRACT. "text" may hold a brief one-line acknowledgement; the card carries the answer.
-
-On follow-up turns ("what if ages 25–54?", "assume only women"), re-run calibration with the new constraint and return a fresh assessment.
-
-If the user message contains a USER OVERRIDES block, those constraints are authoritative.
-
-CHAT OUTPUT CONTRACT
-Return EXACTLY one JSON object. No prose, no markdown, no code fences, no commentary — only JSON.
-
-When asking a follow-up, return this shape (omit "assessment"):
-{
-  "kind": "question",
-  "text": "Which market is this sample for, and what IR did you assume?"
-}
-
-When giving a validation, return this shape (include every field of the base IRResult under "assessment"):
-{
-  "kind": "assessment",
-  "text": "Here's the validation:",
-  "assessment": {
-    "market": "UK",
-    "sample_title": "Premium EV Owners",
-    "predicted_ir_point": 4.8,
-    "predicted_ir_low": 2.5,
-    "predicted_ir_high": 6.5,
-    "verdict": "TOO_HIGH",
-    "assumed_ir": 12,
-    "sample_description": "Adults who own a premium EV purchased in the last 3 years.",
-    "short_reason": "Premium EV ownership + recency filter make 12% unrealistic in a general population.",
-    "assumption_confidence": "MEDIUM",
-    "confidence_reason": "ownership rate assumed, no benchmark available"
-  }
-}
-
-Never mix the two shapes. Never emit the word "null" for the assessment field — simply omit it when kind="question".`;
 
 export const IRResultSchema = z.object({
   market: z.string(),
@@ -379,6 +365,9 @@ Produce the JSON object per the OUTPUT CONTRACT. Temperature is 0; be determinis
       systemInstruction: SYSTEM_INSTRUCTION,
       generationConfig: {
         temperature: 0,
+        topK: 1,
+        topP: 0,
+        candidateCount: 1,
         responseMimeType: "application/json",
         ...(useResponseSchema
           ? { responseSchema: RESPONSE_SCHEMA as unknown as object }
@@ -511,39 +500,203 @@ function extractJsonObject(text: string): string | null {
   return null;
 }
 
-export async function chatIR(input: ChatInput): Promise<ChatResponse> {
+/* ──────────────────────────────────────────────────────────────────────────── *
+ * Determinism layer — normalize, hash, in-memory cache.
+ * Same canonical input → same cache key → byte-identical IRResult forever.
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+const CACHE_TTL_MS = 30 * 60 * 1000;
+const cache: Map<string, { result: IRResult; expires: number }> = new Map();
+
+function cacheGet(key: string): IRResult | null {
+  const hit = cache.get(key);
+  if (!hit) return null;
+  if (hit.expires < Date.now()) {
+    cache.delete(key);
+    return null;
+  }
+  return hit.result;
+}
+
+function cacheSet(key: string, result: IRResult): void {
+  cache.set(key, { result, expires: Date.now() + CACHE_TTL_MS });
+}
+
+export function normalizeCalibratorInput(
+  input: CalibratorInput,
+): CalibratorInput {
+  const out: CalibratorInput = {
+    cs_description: input.cs_description.trim().replace(/\s+/g, " "),
+    market: input.market.trim().toLowerCase(),
+    assumed_ir: Math.round(input.assumed_ir * 10) / 10,
+  };
+  if (input.overrides) {
+    const o = input.overrides;
+    const norm: NonNullable<CalibratorInput["overrides"]> = {};
+    if (typeof o.age_min === "number") norm.age_min = Math.round(o.age_min);
+    if (typeof o.age_max === "number") norm.age_max = Math.round(o.age_max);
+    if (o.gender) norm.gender = o.gender;
+    if (o.seg) norm.seg = o.seg;
+    if (o.geo_type) norm.geo_type = o.geo_type;
+    if (o.cities && o.cities.length > 0) {
+      norm.cities = [...o.cities]
+        .map((c) => c.trim().toLowerCase())
+        .filter(Boolean)
+        .sort();
+    }
+    if (o.category) norm.category = o.category;
+    if (o.recency) norm.recency = o.recency;
+    if (o.frequency) norm.frequency = o.frequency;
+    if (o.brand_specificity) norm.brand_specificity = o.brand_specificity;
+    if (o.logic) norm.logic = o.logic;
+    if (o.clinical) norm.clinical = true;
+    if (o.extra_notes && o.extra_notes.trim()) {
+      norm.extra_notes = o.extra_notes.trim().replace(/\s+/g, " ");
+    }
+    if (Object.keys(norm).length > 0) out.overrides = norm;
+  }
+  return out;
+}
+
+function canonicalStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalStringify).join(",")}]`;
+  }
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, v]) => v !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalStringify(v)}`).join(",")}}`;
+}
+
+export function hashInput(normalized: CalibratorInput): string {
+  return createHash("sha256")
+    .update(canonicalStringify(normalized))
+    .digest("hex");
+}
+
+/* ──────────────────────────────────────────────────────────────────────────── *
+ * Extract phase — turns the conversation into either a follow-up question or
+ * structured CalibratorInput. Only stochastic step in the chat path.
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+const ExtractResultSchema = z.object({
+  kind: z.enum(["question", "inputs"]),
+  question: z.string().nullable().optional(),
+  cs_description: z.string().nullable().optional(),
+  market: z.string().nullable().optional(),
+  assumed_ir: z.number().nullable().optional(),
+  override_age_min: z.number().nullable().optional(),
+  override_age_max: z.number().nullable().optional(),
+  override_gender: z.string().nullable().optional(),
+  override_seg: z.string().nullable().optional(),
+  override_geo_type: z.string().nullable().optional(),
+  override_category: z.string().nullable().optional(),
+  override_recency: z.string().nullable().optional(),
+  override_frequency: z.string().nullable().optional(),
+  override_brand_specificity: z.string().nullable().optional(),
+  override_logic: z.string().nullable().optional(),
+  override_clinical: z.boolean().nullable().optional(),
+  override_extra_notes: z.string().nullable().optional(),
+});
+type ExtractResult = z.infer<typeof ExtractResultSchema>;
+
+const GENDER_VALUES = ["male", "female", "all"] as const;
+const SEG_VALUES = ["ABC1", "ABC1C2", "ABC1C2D", "all"] as const;
+const GEO_VALUES = ["national", "cities", "regions"] as const;
+const CATEGORY_VALUES = [
+  "financial",
+  "fmcg",
+  "tech",
+  "auto",
+  "healthcare",
+  "other",
+] as const;
+const RECENCY_VALUES = ["P3M", "P6M", "P12M", "ever"] as const;
+const FREQUENCY_VALUES = ["heavy", "medium", "light"] as const;
+const BRAND_VALUES = [
+  "category_only",
+  "specific_brand",
+  "niche_premium",
+] as const;
+const LOGIC_VALUES = ["AND", "OR"] as const;
+
+function pick<T extends readonly string[]>(
+  values: T,
+  v: string | null | undefined,
+): T[number] | undefined {
+  if (!v) return undefined;
+  return values.includes(v as T[number]) ? (v as T[number]) : undefined;
+}
+
+function extractToCalibratorInput(
+  e: ExtractResult,
+): CalibratorInput | null {
+  if (
+    !e.cs_description ||
+    !e.market ||
+    typeof e.assumed_ir !== "number"
+  ) {
+    return null;
+  }
+  const overrides: NonNullable<CalibratorInput["overrides"]> = {};
+  if (typeof e.override_age_min === "number")
+    overrides.age_min = e.override_age_min;
+  if (typeof e.override_age_max === "number")
+    overrides.age_max = e.override_age_max;
+  const g = pick(GENDER_VALUES, e.override_gender);
+  if (g) overrides.gender = g;
+  const seg = pick(SEG_VALUES, e.override_seg);
+  if (seg) overrides.seg = seg;
+  const geo = pick(GEO_VALUES, e.override_geo_type);
+  if (geo) overrides.geo_type = geo;
+  const cat = pick(CATEGORY_VALUES, e.override_category);
+  if (cat) overrides.category = cat;
+  const rec = pick(RECENCY_VALUES, e.override_recency);
+  if (rec) overrides.recency = rec;
+  const freq = pick(FREQUENCY_VALUES, e.override_frequency);
+  if (freq) overrides.frequency = freq;
+  const brand = pick(BRAND_VALUES, e.override_brand_specificity);
+  if (brand) overrides.brand_specificity = brand;
+  const logic = pick(LOGIC_VALUES, e.override_logic);
+  if (logic) overrides.logic = logic;
+  if (e.override_clinical === true) overrides.clinical = true;
+  if (e.override_extra_notes && e.override_extra_notes.trim()) {
+    overrides.extra_notes = e.override_extra_notes.trim();
+  }
+  return {
+    cs_description: e.cs_description,
+    market: e.market,
+    assumed_ir: e.assumed_ir,
+    ...(Object.keys(overrides).length > 0 ? { overrides } : {}),
+  };
+}
+
+async function extractInputs(
+  messages: ChatTurn[],
+): Promise<{ ok: true; data: ExtractResult } | { ok: false; error: string; raw?: string }> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return { ok: false, error: "GEMINI_API_KEY not set" };
-  if (input.messages.length === 0) {
-    return { ok: false, error: "no messages provided" };
-  }
 
   const modelName = process.env.GEMINI_MODEL || "gemini-2.5-flash";
   const client = new GoogleGenerativeAI(apiKey);
 
-  const history = input.messages.slice(0, -1).map((m) => ({
+  const history = messages.slice(0, -1).map((m) => ({
     role: m.role === "assistant" ? ("model" as const) : ("user" as const),
     parts: [{ text: m.content }],
   }));
-  const latest = input.messages[input.messages.length - 1];
-  if (latest.role !== "user") {
-    return { ok: false, error: "last message must be from user" };
-  }
+  const latest = messages[messages.length - 1];
 
-  const ov = overrideBlock(input.overrides);
-  const latestMessage = ov ? `${latest.content}${ov}` : latest.content;
-
-  const started = Date.now();
-
-  // responseSchema with a nullable nested OBJECT is unreliable across Gemini
-  // model families (and unsupported on Gemma). Rely on the prompt-level JSON
-  // contract + responseMimeType and post-process defensively.
   const model = client.getGenerativeModel({
     model: modelName,
-    systemInstruction: SYSTEM_INSTRUCTION + CHAT_ADDENDUM,
+    systemInstruction: EXTRACT_SYSTEM_INSTRUCTION,
     generationConfig: {
       temperature: 0,
+      topK: 1,
+      topP: 0,
+      candidateCount: 1,
       responseMimeType: "application/json",
+      responseSchema: EXTRACT_SCHEMA as unknown as object,
     },
   });
 
@@ -551,25 +704,16 @@ export async function chatIR(input: ChatInput): Promise<ChatResponse> {
   try {
     const chat = model.startChat({ history });
     const result = await withTimeout(
-      chat.sendMessage(latestMessage),
-      50_000,
-      `Gemini (${modelName})`,
+      chat.sendMessage(latest.content),
+      45_000,
+      `Gemini extract (${modelName})`,
     );
     raw = result.response.text() ?? "";
   } catch (err) {
-    const msg = (err as Error).message;
-    console.error("[chatIR] model call failed", {
-      model: modelName,
-      ms: Date.now() - started,
-      err: msg,
-    });
-    return { ok: false, error: msg };
+    return { ok: false, error: (err as Error).message };
   }
 
-  if (!raw || raw.trim().length === 0) {
-    console.error("[chatIR] empty response from model", { model: modelName });
-    return { ok: false, error: "empty response from model" };
-  }
+  if (!raw.trim()) return { ok: false, error: "empty extract response" };
 
   const candidate =
     extractJsonObject(raw) ??
@@ -583,38 +727,121 @@ export async function chatIR(input: ChatInput): Promise<ChatResponse> {
   try {
     parsed = JSON.parse(candidate);
   } catch {
-    console.error("[chatIR] non-JSON response", {
-      model: modelName,
-      preview: raw.slice(0, 400),
-    });
-    return { ok: false, raw, error: "LLM returned non-JSON" };
+    return { ok: false, raw, error: "extract returned non-JSON" };
   }
 
-  // Normalise a few common shape-drift cases the model may produce.
-  if (parsed && typeof parsed === "object") {
-    const p = parsed as Record<string, unknown>;
-    if (p.kind === "question") {
-      delete p.assessment;
-    }
-    if (p.kind === "assessment" && typeof p.text !== "string") {
-      p.text = null;
-    }
-  }
-
-  const validated = ChatReplySchema.safeParse(parsed);
+  const validated = ExtractResultSchema.safeParse(parsed);
   if (!validated.success) {
-    console.error("[chatIR] schema validation failed", {
-      model: modelName,
-      zod: validated.error.message,
-      preview: raw.slice(0, 400),
-    });
     return { ok: false, raw, error: validated.error.message };
   }
+  return { ok: true, data: validated.data };
+}
 
-  console.info("[chatIR] ok", {
-    model: modelName,
+/* ──────────────────────────────────────────────────────────────────────────── *
+ * chatIR — orchestrator. Extract → normalize → hash → cache → calibrate.
+ * Public contract unchanged: returns { kind: "question" | "assessment", ... }.
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+export async function chatIR(input: ChatInput): Promise<ChatResponse> {
+  if (input.messages.length === 0) {
+    return { ok: false, error: "no messages provided" };
+  }
+  const latest = input.messages[input.messages.length - 1];
+  if (latest.role !== "user") {
+    return { ok: false, error: "last message must be from user" };
+  }
+
+  const started = Date.now();
+
+  // Phase 1 — extract structured inputs (or a follow-up question) from the
+  // conversation. Stochastic but cheap.
+  const extracted = await extractInputs(input.messages);
+  if (!extracted.ok) {
+    console.error("[chatIR] extract failed", { err: extracted.error });
+    return {
+      ok: false,
+      error: extracted.error,
+      raw: extracted.raw,
+    };
+  }
+
+  const e = extracted.data;
+  if (e.kind === "question") {
+    const text =
+      e.question?.trim() ||
+      "Could you share the sample description, market, and the IR you've assumed?";
+    console.info("[chatIR] extract-only", {
+      ms: Date.now() - started,
+    });
+    return { ok: true, reply: { kind: "question", text } };
+  }
+
+  const baseInput = extractToCalibratorInput(e);
+  if (!baseInput) {
+    // Model said "inputs" but didn't actually fill them — treat as a question.
+    console.warn("[chatIR] inputs incomplete despite kind=inputs", { e });
+    return {
+      ok: true,
+      reply: {
+        kind: "question",
+        text: "I couldn't pin down all three inputs. What's the sample description, the market, and the IR you assumed?",
+      },
+    };
+  }
+
+  // Merge any structured overrides supplied by the UI's adjust panel on top of
+  // anything implied by the conversation. UI wins (it's an explicit pin).
+  const merged: CalibratorInput = {
+    ...baseInput,
+    overrides: { ...(baseInput.overrides ?? {}), ...(input.overrides ?? {}) },
+  };
+  if (merged.overrides && Object.keys(merged.overrides).length === 0) {
+    delete merged.overrides;
+  }
+
+  // Phase 2 — normalize + hash + cache lookup.
+  const normalized = normalizeCalibratorInput(merged);
+  const key = hashInput(normalized);
+  const cached = cacheGet(key);
+  if (cached) {
+    console.info("[chatIR] cache-hit", {
+      key: key.slice(0, 12),
+      ms: Date.now() - started,
+    });
+    return {
+      ok: true,
+      reply: {
+        kind: "assessment",
+        text: "Here's the validation:",
+        assessment: cached,
+      },
+    };
+  }
+
+  // Phase 3 — calibrate via the deterministic single-shot path.
+  const calibrated = await calibrateIR(normalized);
+  if (!calibrated.ok || !calibrated.data) {
+    console.error("[chatIR] calibrate failed", {
+      err: calibrated.error,
+    });
+    return {
+      ok: false,
+      error: calibrated.error ?? "calibrator failed",
+      raw: calibrated.raw,
+    };
+  }
+
+  cacheSet(key, calibrated.data);
+  console.info("[chatIR] cache-miss", {
+    key: key.slice(0, 12),
     ms: Date.now() - started,
-    kind: validated.data.kind,
   });
-  return { ok: true, reply: validated.data };
+  return {
+    ok: true,
+    reply: {
+      kind: "assessment",
+      text: "Here's the validation:",
+      assessment: calibrated.data,
+    },
+  };
 }
